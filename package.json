@@ -1,0 +1,44 @@
+{
+  "name": "mcp-ssh",
+  "version": "1.0.0",
+  "description": "SSH连接管理的MCP工具，支持自动记忆凭证、服务器列表和后台操作",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node-dev --respawn src/index.ts",
+    "test": "jest",
+    "register": "cursor tool register ssh-mcp -p dist/index.js",
+    "unregister": "cursor tool unregister ssh-mcp"
+  },
+  "keywords": [
+    "mcp",
+    "ssh",
+    "terminal",
+    "connection",
+    "remote",
+    "server",
+    "tools",
+    "ai"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.6.1",
+    "@types/node": "^20.0.0",
+    "dotenv": "^16.0.3",
+    "keytar": "^7.9.0",
+    "lokijs": "^1.5.12",
+    "node-ssh": "^13.1.0",
+    "ssh2": "^1.14.0",
+    "typescript": "^5.0.0",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "@types/lokijs": "^1.5.14",
+    "@types/ssh2": "^1.15.4",
+    "ts-node": "^10.9.1",
+    "ts-node-dev": "^2.0.0"
+  }
+}
