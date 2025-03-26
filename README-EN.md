@@ -74,6 +74,7 @@ Through simple natural language instructions, AI can help you complete all of th
 git clone https://github.com/shuakami/mcp-ssh.git
 cd mcp-ssh
 npm install
+npm run build
 ```
 > ⚠️ **Important Note**: Do not delete the cloned or extracted files after installation, as the plugin needs continuous access to these files!
 

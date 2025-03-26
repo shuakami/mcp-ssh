@@ -74,6 +74,7 @@
 git clone https://github.com/shuakami/mcp-ssh.git
 cd mcp-ssh
 npm install
+npm run build
 ```
 > ⚠️ **重要提示**：安装后请不要删除克隆或解压的文件，插件需要持续访问这些文件！
 
