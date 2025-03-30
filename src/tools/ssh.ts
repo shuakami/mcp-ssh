@@ -583,6 +583,10 @@ export class SshMCP {
           // 构建输出
           let output = '';
           
+          // 构建命令提示符
+          const currentDir = connection.currentDirectory || '~';
+          const promptPrefix = `[${connection.config.username}@${connection.config.host}`;
+          
           if (result.stdout) {
             output += result.stdout;
           }
@@ -595,6 +599,10 @@ export class SshMCP {
           if (result.code !== 0) {
             output += `\n命令退出码: ${result.code}`;
           }
+          
+          // 在输出末尾添加当前目录提示
+          if (output) output += '\n';
+          output += `\n${promptPrefix} ${currentDir}]$ `;
           
           // 如果是tmux命令且命令执行成功，增强输出信息
           if (isTmuxCommand && result.code === 0 && (!output || output.trim() === '')) {
