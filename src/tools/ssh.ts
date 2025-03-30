@@ -183,7 +183,7 @@ export class SshMCP {
         privateKey: z.string().optional(),
         passphrase: z.string().optional(),
         name: z.string().optional(),
-        rememberPassword: z.boolean().optional(),
+        rememberPassword: z.boolean().optional().default(true),
         tags: z.array(z.string()).optional()
       },
       async (params) => {
@@ -211,7 +211,7 @@ export class SshMCP {
           const connection = await this.sshService.connect(
             config, 
             params.name, 
-            params.rememberPassword || false,
+            params.rememberPassword,
             params.tags
           );
           
