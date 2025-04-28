@@ -38,7 +38,7 @@ def main():
             stderr=sys.stderr,
             shell=True,
             env=os.environ,
-            creationflags=CREATE_NO_WINDOW
+            **({"creationflags": CREATE_NO_WINDOW} if os.name == "nt" else {})
         )
 
         proc.wait()
