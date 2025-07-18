@@ -325,3 +325,32 @@ This project is licensed under the ISC License - see the [LICENSE](LICENSE) file
 ---
 
 If this project helps you, please give it a Star ⭐️ (｡♥‿♥｡) 
+
+## Running with Docker (Recommended)
+
+You can also run this tool inside a Docker container. This is the recommended way to use it, as it avoids any potential conflicts with your local environment.
+
+1.  **Build the Docker image:**
+
+    ```bash
+    docker build -t mcp-ssh .
+    ```
+
+2.  **Run the Docker container (with data persistence):**
+
+    To ensure your connection configurations and credentials are not lost when the container restarts, we strongly recommend using a Docker Volume.
+
+    ```bash
+    # (Before the first run) Create a volume to store the data
+    docker volume create mcp-ssh-data
+
+    # Run the container and mount the volume to the /root/.mcp-ssh directory inside the container
+    # We also still recommend mounting your local .ssh directory to use your existing keys
+    docker run -it -v mcp-ssh-data:/root/.mcp-ssh -v ~/.ssh:/root/.ssh mcp-ssh
+    ```
+
+    On Windows, you should use `%USERPROFILE%\.ssh` instead of `~/.ssh`:
+
+    ```bash
+    docker run -it -v mcp-ssh-data:/root/.mcp-ssh -v %USERPROFILE%\.ssh:/root/.ssh mcp-ssh
+    ``` 
