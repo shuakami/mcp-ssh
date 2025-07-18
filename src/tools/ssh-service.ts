@@ -5,7 +5,7 @@ import * as path from 'path';
 import * as os from 'os';
 import * as crypto from 'crypto';
 import Loki, { Collection } from 'lokijs';
-import keytar from 'keytar';
+// import keytar from 'keytar'; // We will import this dynamically
 import { EventEmitter } from 'events';
 import * as net from 'net';
 import { Client as SSHClient, ConnectConfig, SFTPWrapper } from 'ssh2';
@@ -156,6 +156,8 @@ export class SSHService {
   private dataPath: string;
   private serviceReady: boolean = false;
   private serviceReadyPromise: Promise<void>;
+  private isDocker: boolean = false;
+  private credentialsCache: Map<string, {password?: string, passphrase?: string}> = new Map();
   
   // 后台任务管理
   private backgroundTasks: Map<string, BackgroundTask> = new Map();
@@ -179,6 +181,7 @@ export class SSHService {
   
   constructor() {
     this.dataPath = process.env.SSH_DATA_PATH || path.join(os.homedir(), '.mcp-ssh');
+    this.isDocker = process.env.IS_DOCKER === 'true';
     
     // 创建数据目录（如果不存在）
     if (!fs.existsSync(this.dataPath)) {
@@ -300,32 +303,37 @@ export class SSHService {
     }
   }
   
-  // 保存密码到安全存储
   private async saveCredentials(id: string, password?: string, passphrase?: string): Promise<void> {
-    if (password) {
-      await keytar.setPassword('mcp-ssh', `${id}-password`, password);
+    if (this.isDocker) {
+        this.credentialsCache.set(id, { password, passphrase });
+        return;
     }
-    
-    if (passphrase) {
-      await keytar.setPassword('mcp-ssh', `${id}-passphrase`, passphrase);
+    try {
+      const keytar = (await import('keytar')).default;
+      if (password) {
+        await keytar.setPassword('mcp-ssh', id, password);
+      }
+      if (passphrase) {
+        await keytar.setPassword('mcp-ssh-passphrase', id, passphrase);
+      }
+    } catch (error) {
+      console.warn(`无法保存凭证: ${error}`);
     }
   }
   
-  // 从安全存储获取密码
   private async getCredentials(id: string): Promise<{password?: string, passphrase?: string}> {
-    const result: {password?: string, passphrase?: string} = {};
-    
-    const password = await keytar.getPassword('mcp-ssh', `${id}-password`);
-    if (password) {
-      result.password = password;
+    if (this.isDocker) {
+        return this.credentialsCache.get(id) || {};
     }
-    
-    const passphrase = await keytar.getPassword('mcp-ssh', `${id}-passphrase`);
-    if (passphrase) {
-      result.passphrase = passphrase;
+    try {
+      const keytar = (await import('keytar')).default;
+      const password = await keytar.getPassword('mcp-ssh', id);
+      const passphrase = await keytar.getPassword('mcp-ssh-passphrase', id);
+      return { password: password || undefined, passphrase: passphrase || undefined };
+    } catch (error) {
+      console.warn(`无法检索凭证: ${error}`);
+      return {};
     }
-    
-    return result;
   }
   
   // 连接到SSH服务器
@@ -1204,31 +1212,29 @@ export class SSHService {
   public async deleteConnection(connectionId: string): Promise<boolean> {
     await this.ensureReady();
     
-    const connection = this.connections.get(connectionId);
-    if (!connection) {
-      return false;
-    }
-    
-    // 如果连接中，先断开
-    if (connection.status === ConnectionStatus.CONNECTED && connection.client) {
-      await this.disconnect(connectionId);
-    }
-    
-    // 删除连接
-    this.connections.delete(connectionId);
+    // 断开连接
+    await this.disconnect(connectionId);
     
     // 从数据库中删除
     if (this.connectionCollection) {
       this.connectionCollection.findAndRemove({ id: connectionId });
-      
-      if (this.db) {
-        this.db.saveDatabase();
-      }
     }
     
+    // 从内存中删除
+    this.connections.delete(connectionId);
+    
     // 删除凭据
-    await keytar.deletePassword('mcp-ssh', `${connectionId}-password`);
-    await keytar.deletePassword('mcp-ssh', `${connectionId}-passphrase`);
+    if (!this.isDocker) {
+      try {
+        const keytar = (await import('keytar')).default;
+        await keytar.deletePassword('mcp-ssh', connectionId);
+        await keytar.deletePassword('mcp-ssh-passphrase', connectionId);
+      } catch (error) {
+        console.warn(`无法删除凭证: ${error}`);
+      }
+    } else {
+      this.credentialsCache.delete(connectionId);
+    }
     
     return true;
   }

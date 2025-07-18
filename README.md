@@ -325,3 +325,27 @@ SSH MCP 工具内置了智能的阻塞检测机制：
 ---
 
 如果这个项目对你有帮助，欢迎给个 Star ⭐️ (｡♥‿♥｡) 
+
+## 使用 Docker 运行 (推荐)
+
+您也可以在 Docker 容器中运行此工具。这是推荐的使用方式，因为它可以避免与您的本地环境产生任何潜在的冲突。
+
+1.  **构建 Docker 镜像:**
+
+    ```bash
+    docker build -t mcp-ssh .
+    ```
+
+2.  **运行 Docker 容器:**
+
+    以下命令将运行容器并将您本地的 `~/.ssh` 目录挂载到容器中。这允许该工具访问您现有的 SSH 密钥。
+
+    ```bash
+    docker run -it -v ~/.ssh:/root/.ssh mcp-ssh
+    ```
+
+    在 Windows 上，您应该使用 `%USERPROFILE%\.ssh` 来代替 `~/.ssh`:
+
+    ```bash
+    docker run -it -v %USERPROFILE%\.ssh:/root/.ssh mcp-ssh
+    ``` 

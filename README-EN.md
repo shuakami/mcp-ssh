@@ -325,3 +325,27 @@ This project is licensed under the ISC License - see the [LICENSE](LICENSE) file
 ---
 
 If this project helps you, please give it a Star ⭐️ (｡♥‿♥｡) 
+
+## Running with Docker (Recommended)
+
+You can also run this tool inside a Docker container. This is the recommended way to use it, as it avoids any potential conflicts with your local environment.
+
+1.  **Build the Docker image:**
+
+    ```bash
+    docker build -t mcp-ssh .
+    ```
+
+2.  **Run the Docker container:**
+
+    The following command will run the container and mount your local `~/.ssh` directory into the container. This allows the tool to access your existing SSH keys.
+
+    ```bash
+    docker run -it -v ~/.ssh:/root/.ssh mcp-ssh
+    ```
+
+    On Windows, you should use `%USERPROFILE%\.ssh` instead of `~/.ssh`:
+
+    ```bash
+    docker run -it -v %USERPROFILE%\.ssh:/root/.ssh mcp-ssh
+    ``` 
