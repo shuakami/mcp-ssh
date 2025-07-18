@@ -324,7 +324,7 @@ SSH MCP 工具内置了智能的阻塞检测机制：
 
 ---
 
-如果这个项目对你有帮助，欢迎给个 Star ⭐️ (｡♥‿♥｡) 
+If this project helps you, please give it a Star ⭐️ (｡♥‿♥｡) 
 
 ## 使用 Docker 运行 (推荐)
 

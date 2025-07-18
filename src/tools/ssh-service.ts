@@ -1240,10 +1240,6 @@ export class SSHService {
     if (this.connectionCollection) {
       this.connectionCollection.findAndRemove({ id: connectionId });
     }
-
-    if (this.credentialCollection) {
-      this.credentialCollection.findAndRemove({ id: connectionId });
-    }
     
     // 从内存中删除
     this.connections.delete(connectionId);
