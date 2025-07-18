@@ -36,7 +36,9 @@
     "zod": "^3.22.4"
   },
   "devDependencies": {
+    "@types/keytar": "^4.4.0",
     "@types/lokijs": "^1.5.14",
+    "@types/node-ssh": "^7.0.6",
     "@types/ssh2": "^1.15.4",
     "ts-node": "^10.9.1",
     "ts-node-dev": "^2.0.0"
