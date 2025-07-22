@@ -175,6 +175,7 @@ export class SshMCP {
     // 创建新连接
     this.server.tool(
       "connect",
+      "Establishes a new SSH connection to a server.",
       {
         host: z.string(),
         port: z.number().optional(),
@@ -239,6 +240,7 @@ export class SshMCP {
     // 断开连接
     this.server.tool(
       "disconnect",
+      "Disconnects an active SSH connection.",
       {
         connectionId: z.string()
       },
@@ -296,6 +298,7 @@ export class SshMCP {
     // 获取所有连接
     this.server.tool(
       "listConnections",
+      "Lists all saved SSH connections.",
       {},
       async () => {
         try {
@@ -335,6 +338,7 @@ export class SshMCP {
     // 获取连接详情
     this.server.tool(
       "getConnection",
+      "Gets detailed information about a specific SSH connection.",
       {
         connectionId: z.string()
       },
@@ -373,6 +377,7 @@ export class SshMCP {
     // 删除连接
     this.server.tool(
       "deleteConnection",
+      "Deletes a saved SSH connection.",
       {
         connectionId: z.string()
       },
@@ -438,6 +443,7 @@ export class SshMCP {
     // 执行命令
     this.server.tool(
       "executeCommand",
+      "Executes a command on a remote server via SSH.",
       {
         connectionId: z.string(),
         command: z.string(),
@@ -971,6 +977,7 @@ export class SshMCP {
     // 后台执行命令
     this.server.tool(
       "backgroundExecute",
+      "Executes a command in the background on a remote server at a specified interval.",
       {
         connectionId: z.string(),
         command: z.string(),
@@ -1061,6 +1068,7 @@ export class SshMCP {
     // 停止后台执行
     this.server.tool(
       "stopBackground",
+      "Stops a background command execution on a specific connection.",
       {
         connectionId: z.string()
       },
@@ -1111,6 +1119,7 @@ export class SshMCP {
     // 获取当前目录工具
     this.server.tool(
       "getCurrentDirectory",
+      "Gets the current working directory of an SSH connection.",
       {
         connectionId: z.string()
       },
@@ -1170,6 +1179,7 @@ export class SshMCP {
     // 上传文件
     this.server.tool(
       "uploadFile",
+      "Uploads a local file to a remote server.",
       {
         connectionId: z.string(),
         localPath: z.string(),
@@ -1273,6 +1283,7 @@ export class SshMCP {
     // 下载文件
     this.server.tool(
       "downloadFile",
+      "Downloads a file from a remote server to the local machine.",
       {
         connectionId: z.string(),
         remotePath: z.string(),
@@ -1378,6 +1389,7 @@ export class SshMCP {
     // 批量上传文件
     this.server.tool(
       "batchUploadFiles",
+      "Uploads multiple local files to a remote server.",
       {
         connectionId: z.string(),
         files: z.array(z.object({
@@ -1509,6 +1521,7 @@ export class SshMCP {
     // 批量下载文件
     this.server.tool(
       "batchDownloadFiles",
+      "Downloads multiple files from a remote server.",
       {
         connectionId: z.string(),
         files: z.array(z.object({
@@ -1660,6 +1673,7 @@ export class SshMCP {
     // 获取文件传输状态
     this.server.tool(
       "getFileTransferStatus",
+      "Gets the status of a specific file transfer.",
       {
         transferId: z.string()
       },
@@ -1749,6 +1763,7 @@ export class SshMCP {
     // 列出所有文件传输
     this.server.tool(
       "listFileTransfers",
+      "Lists all recent file transfers.",
       {},
       async () => {
         try {
@@ -1834,6 +1849,7 @@ export class SshMCP {
     // 列出活跃会话
     this.server.tool(
       "listActiveSessions",
+      "Lists all currently active SSH sessions.",
       {},
       async () => {
         try {
@@ -1886,6 +1902,7 @@ export class SshMCP {
     // 列出后台任务
     this.server.tool(
       "listBackgroundTasks",
+      "Lists all background tasks currently running.",
       {},
       () => {
         try {
@@ -1933,6 +1950,7 @@ export class SshMCP {
     // 停止所有后台任务
     this.server.tool(
       "stopAllBackgroundTasks",
+      "Stops all running background tasks.",
       {},
       () => {
         try {
@@ -1978,6 +1996,7 @@ export class SshMCP {
     // 创建终端会话
     this.server.tool(
       "mcp_ssh_mcp_createTerminalSession",
+      "Creates a new interactive terminal session.",
       {
         connectionId: z.string(),
         rows: z.number().optional(),
@@ -2039,6 +2058,7 @@ export class SshMCP {
     // 向终端写入数据
     this.server.tool(
       "mcp_ssh_mcp_writeToTerminal",
+      "Writes data to an interactive terminal session.",
       {
         sessionId: z.string(),
         data: z.string()
@@ -2075,6 +2095,7 @@ export class SshMCP {
     // 创建隧道
     this.server.tool(
       "createTunnel",
+      "Creates an SSH tunnel (port forwarding).",
       {
         connectionId: z.string(),
         localPort: z.number(),
@@ -2137,6 +2158,7 @@ export class SshMCP {
     // 关闭隧道
     this.server.tool(
       "closeTunnel",
+      "Closes an active SSH tunnel.",
       {
         tunnelId: z.string()
       },
@@ -2175,6 +2197,7 @@ export class SshMCP {
     // 列出所有隧道
     this.server.tool(
       "listTunnels",
+      "Lists all active SSH tunnels.",
       {},
       () => {
         try {
