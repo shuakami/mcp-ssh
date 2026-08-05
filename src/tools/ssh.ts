@@ -2030,9 +2030,22 @@ export class SshMCP {
         try {
           const { connectionId, rows, cols, term } = params;
           const sessionId = await this.sshService.createTerminalSession(connectionId, { rows, cols, term });
-          
+
+          // 退订逻辑：置为幂等，且两个监听器一并摘除。
+          // 原实现只在 terminal-close 事件到达时才退订，一旦事件未能发出
+          // （例如流异常关闭），监听器及其闭包就永久留在 EventEmitter 上。
+          let disposed = false;
+          let unsubscribeData: () => void = () => {};
+          let unsubscribeClose: () => void = () => {};
+          const dispose = () => {
+            if (disposed) return;
+            disposed = true;
+            unsubscribeData();
+            unsubscribeClose();
+          };
+
           // 设置终端数据监听器
-          const unsubscribeData = this.sshService.onTerminalData((event) => {
+          unsubscribeData = this.sshService.onTerminalData((event) => {
             if (event.sessionId === sessionId) {
               // 应用输出长度限制
               const limitedData = this.limitOutputLength(event.data);
@@ -2044,12 +2057,11 @@ export class SshMCP {
               });
             }
           });
-          
+
           // 当终端关闭时，取消订阅
-          const unsubscribeClose = this.sshService.onTerminalClose((event) => {
+          unsubscribeClose = this.sshService.onTerminalClose((event) => {
             if (event.sessionId === sessionId) {
-              unsubscribeData();
-              unsubscribeClose(); // 也取消自身的订阅
+              dispose();
               (this.server as any).sendEvent('terminal_closed', {
                 sessionId: event.sessionId,
                 human: `终端会话 ${sessionId} 已关闭`

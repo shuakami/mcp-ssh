@@ -19,18 +19,40 @@ async function main() {
   // 实例化SSH MCP
   const sshMCP = new SshMCP();
 
-  // 处理进程退出
-  process.on('SIGINT', async () => {
-    console.log('正在关闭SSH MCP服务...');
-    await sshMCP.close();
-    process.exit(0);
-  });
+  // 优雅关闭，保证只执行一次
+  let shuttingDown = false;
+  const shutdown = async (reason: string, code: number = 0) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.error(`正在关闭SSH MCP服务 (${reason})...`);
 
-  process.on('SIGTERM', async () => {
-    console.log('正在关闭SSH MCP服务...');
-    await sshMCP.close();
-    process.exit(0);
-  });
+    // 兜底：清理若卡住，最多等 5 秒就强制退出
+    const forceExit = setTimeout(() => {
+      console.error('清理超时，强制退出');
+      process.exit(code);
+    }, 5000);
+    if (typeof forceExit.unref === 'function') forceExit.unref();
+
+    try {
+      await sshMCP.close();
+    } catch (err) {
+      console.error('关闭时出错:', err);
+    }
+    clearTimeout(forceExit);
+    process.exit(code);
+  };
+
+  process.on('SIGINT', () => { void shutdown('SIGINT'); });
+  process.on('SIGTERM', () => { void shutdown('SIGTERM'); });
+
+  // 父进程退出检测。
+  //
+  // MCP 走 stdio 通信，父进程（Claude/编辑器）退出时 stdin 会关闭。
+  // 不监听的话本进程会变成孤儿：既没人使用，也不会退出，
+  // 带着已连接的 SSH 会话和累积的内存一直挂着。
+  process.stdin.on('end', () => { void shutdown('父进程已退出 (stdin 关闭)'); });
+  process.stdin.on('close', () => { void shutdown('父进程已退出 (stdin 关闭)'); });
+  process.stdin.on('error', () => { void shutdown('stdin 错误'); });
 
   // 处理未捕获的异常，避免崩溃
   process.on('uncaughtException', (err) => {
@@ -43,7 +65,7 @@ async function main() {
     // 不退出进程，保持SSH服务运行
   });
 
-  console.log('SSH MCP服务已启动');
+  console.error('SSH MCP服务已启动');
 }
 
 // 启动应用
