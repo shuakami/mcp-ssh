@@ -60,7 +60,7 @@ export class ProcessManager {
         try {
           // 检查进程是否还在运行
           process.kill(lockData.pid, 0);
-          console.log('发现已存在的MCP-SSH实例，正在终止旧进程...');
+          console.error('发现已存在的MCP-SSH实例，正在终止旧进程...');
           
           // 发送终止信号给旧进程
           process.kill(lockData.pid, 'SIGTERM');
@@ -76,7 +76,7 @@ export class ProcessManager {
           fs.unlinkSync(LOCK_FILE);
         } catch (e) {
           // 进程不存在，删除旧的锁文件
-          console.log('发现旧的锁文件但进程已不存在，正在清理...');
+          console.error('发现旧的锁文件但进程已不存在，正在清理...');
           fs.unlinkSync(LOCK_FILE);
         }
       }
@@ -88,7 +88,7 @@ export class ProcessManager {
         timestamp: Date.now()
       }));
 
-      console.log('MCP-SSH进程锁创建成功');
+      console.error('MCP-SSH进程锁创建成功');
       return true;
     } catch (error) {
       console.error('处理锁文件时出错:', error);
