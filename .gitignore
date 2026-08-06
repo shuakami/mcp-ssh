@@ -11,3 +11,4 @@ dist/
 credentials.json
 connections.json
 .mcp-ssh.lock 
+PR_DESCRIPTION.md
