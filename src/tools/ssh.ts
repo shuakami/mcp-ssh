@@ -85,8 +85,12 @@ export class SshMCP {
       info += `密码: ${'*'.repeat(connection.config.password.length)}\n`;
     }
     
-    if (connection.config.privateKey) {
-      info += `私钥认证: 是\n`;
+    if (connection.config.privateKey || connection.config.privateKeyPath) {
+      info += `私钥认证: 是`;
+      if (connection.config.privateKeyPath) {
+        info += `（${connection.config.privateKeyPath}）`;
+      }
+      info += `\n`;
     }
     
     info += `状态: ${statusText[connection.status as ConnectionStatus]}\n`;
@@ -247,7 +251,8 @@ export class SshMCP {
           if (params.privateKey) {
             // 检查是否是私钥内容（以 -----BEGIN 开头）还是文件路径
             if (params.privateKey.trim().startsWith('-----BEGIN')) {
-              // 直接使用私钥内容
+              // 直接使用私钥内容。这种情况下没有路径可记，
+              // 连接不会被持久化为可重连的私钥连接。
               config.privateKey = params.privateKey;
             } else {
               // 视为文件路径，读取私钥内容
@@ -266,8 +271,10 @@ export class SshMCP {
                   isError: true
                 };
               }
-              // 读取私钥文件内容
+              // 读取私钥文件内容，同时记下路径。
+              // 持久化时只保存路径，私钥内容不落库。
               config.privateKey = fs.readFileSync(keyPath, 'utf8');
+              config.privateKeyPath = keyPath;
             }
             config.passphrase = params.passphrase;
           }
@@ -282,11 +289,16 @@ export class SshMCP {
           
           // 记录活跃连接
           this.activeConnections.set(connection.id, new Date());
-          
+
+          // 首次连接某主机时告知其密钥指纹，让用户有机会核对
+          const notice = connection.hostKeyNotice
+            ? `${connection.hostKeyNotice}\n\n`
+            : '';
+
           return {
             content: [{
               type: "text",
-              text: `连接成功!\n\n${this.formatConnectionInfo(connection)}`
+              text: `连接成功!\n\n${notice}${this.formatConnectionInfo(connection)}`
             }]
           };
         } catch (error) {
@@ -542,12 +554,21 @@ export class SshMCP {
           // 更新活跃时间
           this.activeConnections.set(connectionId, new Date());
           
-          // 解析tmux命令
-          const tmuxSendKeysRegex = /tmux\s+send-keys\s+(?:-t\s+)?["']?([^"'\s]+)["']?\s+["']?(.+?)["']?\s+(?:Enter|C-m)/i;
-          const tmuxCaptureRegex = /tmux\s+capture-pane\s+(?:-t\s+)["']?([^"'\s]+)["']?/i;
-          const tmuxNewSessionRegex = /tmux\s+new-session\s+(?:-[ds]\s+)+(?:-s\s+)["']?([^"'\s]+)["']?/i;
-          const tmuxKillSessionRegex = /tmux\s+kill-session\s+(?:-t\s+)["']?([^"'\s]+)["']?/i;
-          const tmuxHasSessionRegex = /tmux\s+has-session\s+(?:-t\s+)["']?([^"'\s]+)["']?/i;
+          // 解析tmux命令。
+          //
+          // 会话名的捕获组限制为 [A-Za-z0-9_.-]，这是 tmux 会话名的常用字符集。
+          // 原来用的是 [^"'\s]+，只排除引号和空白，于是 ; $() ` | & 都能进来，
+          // 而捕获到的名字随后会被不加引号地拼进 `tmux capture-pane -t ${name}`
+          // 等命令在远程执行。虽然调用方本就有任意执行权限，但这些预检命令
+          // 跑在 force 门禁**之前**——用户被告知「本次操作已取消」时，
+          // 注入的载荷其实已经执行了；任何审阅 command 字符串的外层策略也会被绕过。
+          // 现在不匹配的会话名直接走普通执行路径，不再进入 tmux 增强逻辑。
+          const NAME = `[A-Za-z0-9_.\\-]+`;
+          const tmuxSendKeysRegex = new RegExp(`tmux\\s+send-keys\\s+(?:-t\\s+)?["']?(${NAME})["']?\\s+["']?(.+?)["']?\\s+(?:Enter|C-m)`, 'i');
+          const tmuxCaptureRegex = new RegExp(`tmux\\s+capture-pane\\s+(?:-t\\s+)["']?(${NAME})["']?`, 'i');
+          const tmuxNewSessionRegex = new RegExp(`tmux\\s+new-session\\s+(?:-[ds]\\s+)+(?:-s\\s+)["']?(${NAME})["']?`, 'i');
+          const tmuxKillSessionRegex = new RegExp(`tmux\\s+kill-session\\s+(?:-t\\s+)["']?(${NAME})["']?`, 'i');
+          const tmuxHasSessionRegex = new RegExp(`tmux\\s+has-session\\s+(?:-t\\s+)["']?(${NAME})["']?`, 'i');
           
           // 检查是否需要在执行前捕获tmux会话内容（用于比较前后差异）
           let beforeCapture: CommandResult | undefined;
@@ -570,8 +591,10 @@ export class SshMCP {
 
                   if (checkResult?.stdout) {
                     const [panePid, currentCommand] = checkResult.stdout.trim().split(' ');
-                    
-                    if (panePid) {
+
+                    // panePid 来自远程输出，会被拼进 ps / pgrep 命令。
+                    // 只接受纯数字，否则畸形或被操纵的 pane_pid 就成了注入点。
+                    if (panePid && /^\d+$/.test(panePid)) {
                       // 获取进程状态
                       const processResult: CommandResult = await this.sshService.executeCommand(
                         connectionId,
@@ -910,8 +933,9 @@ export class SshMCP {
                         
                         if (checkResult?.stdout) {
                           const [panePid, currentCommand] = checkResult.stdout.trim().split(' ');
-                          
-                          if (panePid) {
+
+                          // 同上：只接受纯数字的 pid
+                          if (panePid && /^\d+$/.test(panePid)) {
                             // 获取进程状态
                             const processResult = await this.sshService.executeCommand(
                               connectionId,
