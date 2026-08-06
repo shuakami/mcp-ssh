@@ -85,8 +85,12 @@ export class SshMCP {
       info += `密码: ${'*'.repeat(connection.config.password.length)}\n`;
     }
     
-    if (connection.config.privateKey) {
-      info += `私钥认证: 是\n`;
+    if (connection.config.privateKey || connection.config.privateKeyPath) {
+      info += `私钥认证: 是`;
+      if (connection.config.privateKeyPath) {
+        info += `（${connection.config.privateKeyPath}）`;
+      }
+      info += `\n`;
     }
     
     info += `状态: ${statusText[connection.status as ConnectionStatus]}\n`;
@@ -158,6 +162,47 @@ export class SshMCP {
   }
 
   /**
+   * 等待一批传输全部结束。
+   *
+   * 原实现是个没有超时的 setInterval：只要有任何一个传输卡在 in-progress
+   * （例如底层流出错但状态没被置为 failed），这个 Promise 就永远不 resolve，
+   * 工具调用挂死、定时器和闭包一直留在堆上。这里补上超时上限。
+   */
+  private waitForTransfers(transferIds: string[], timeoutMs: number = 30 * 60 * 1000): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const isAllDone = () => transferIds.every(id => {
+        const info = this.sshService.getTransferInfo(id);
+        return info && (info.status === 'completed' || info.status === 'failed');
+      });
+
+      // 可能进来时就已经全部结束了
+      if (isAllDone()) {
+        resolve();
+        return;
+      }
+
+      const finish = () => {
+        clearInterval(checkInterval);
+        clearTimeout(timeoutTimer);
+        resolve();
+      };
+
+      const checkInterval = setInterval(() => {
+        if (isAllDone()) finish();
+      }, 500);
+
+      const timeoutTimer = setTimeout(() => {
+        console.error(`等待传输完成超时（${timeoutMs}ms），仍有传输未结束`);
+        finish();
+      }, timeoutMs);
+
+      // 这两个定时器不应阻止进程退出
+      if (typeof checkInterval.unref === 'function') checkInterval.unref();
+      if (typeof timeoutTimer.unref === 'function') timeoutTimer.unref();
+    });
+  }
+
+  /**
    * 停止后台任务执行
    */
   private stopBackgroundExecution(connectionId: string): void {
@@ -206,7 +251,8 @@ export class SshMCP {
           if (params.privateKey) {
             // 检查是否是私钥内容（以 -----BEGIN 开头）还是文件路径
             if (params.privateKey.trim().startsWith('-----BEGIN')) {
-              // 直接使用私钥内容
+              // 直接使用私钥内容。这种情况下没有路径可记，
+              // 连接不会被持久化为可重连的私钥连接。
               config.privateKey = params.privateKey;
             } else {
               // 视为文件路径，读取私钥内容
@@ -225,8 +271,10 @@ export class SshMCP {
                   isError: true
                 };
               }
-              // 读取私钥文件内容
+              // 读取私钥文件内容，同时记下路径。
+              // 持久化时只保存路径，私钥内容不落库。
               config.privateKey = fs.readFileSync(keyPath, 'utf8');
+              config.privateKeyPath = keyPath;
             }
             config.passphrase = params.passphrase;
           }
@@ -241,11 +289,16 @@ export class SshMCP {
           
           // 记录活跃连接
           this.activeConnections.set(connection.id, new Date());
-          
+
+          // 首次连接某主机时告知其密钥指纹，让用户有机会核对
+          const notice = connection.hostKeyNotice
+            ? `${connection.hostKeyNotice}\n\n`
+            : '';
+
           return {
             content: [{
               type: "text",
-              text: `连接成功!\n\n${this.formatConnectionInfo(connection)}`
+              text: `连接成功!\n\n${notice}${this.formatConnectionInfo(connection)}`
             }]
           };
         } catch (error) {
@@ -501,12 +554,21 @@ export class SshMCP {
           // 更新活跃时间
           this.activeConnections.set(connectionId, new Date());
           
-          // 解析tmux命令
-          const tmuxSendKeysRegex = /tmux\s+send-keys\s+(?:-t\s+)?["']?([^"'\s]+)["']?\s+["']?(.+?)["']?\s+(?:Enter|C-m)/i;
-          const tmuxCaptureRegex = /tmux\s+capture-pane\s+(?:-t\s+)["']?([^"'\s]+)["']?/i;
-          const tmuxNewSessionRegex = /tmux\s+new-session\s+(?:-[ds]\s+)+(?:-s\s+)["']?([^"'\s]+)["']?/i;
-          const tmuxKillSessionRegex = /tmux\s+kill-session\s+(?:-t\s+)["']?([^"'\s]+)["']?/i;
-          const tmuxHasSessionRegex = /tmux\s+has-session\s+(?:-t\s+)["']?([^"'\s]+)["']?/i;
+          // 解析tmux命令。
+          //
+          // 会话名的捕获组限制为 [A-Za-z0-9_.-]，这是 tmux 会话名的常用字符集。
+          // 原来用的是 [^"'\s]+，只排除引号和空白，于是 ; $() ` | & 都能进来，
+          // 而捕获到的名字随后会被不加引号地拼进 `tmux capture-pane -t ${name}`
+          // 等命令在远程执行。虽然调用方本就有任意执行权限，但这些预检命令
+          // 跑在 force 门禁**之前**——用户被告知「本次操作已取消」时，
+          // 注入的载荷其实已经执行了；任何审阅 command 字符串的外层策略也会被绕过。
+          // 现在不匹配的会话名直接走普通执行路径，不再进入 tmux 增强逻辑。
+          const NAME = `[A-Za-z0-9_.\\-]+`;
+          const tmuxSendKeysRegex = new RegExp(`tmux\\s+send-keys\\s+(?:-t\\s+)?["']?(${NAME})["']?\\s+["']?(.+?)["']?\\s+(?:Enter|C-m)`, 'i');
+          const tmuxCaptureRegex = new RegExp(`tmux\\s+capture-pane\\s+(?:-t\\s+)["']?(${NAME})["']?`, 'i');
+          const tmuxNewSessionRegex = new RegExp(`tmux\\s+new-session\\s+(?:-[ds]\\s+)+(?:-s\\s+)["']?(${NAME})["']?`, 'i');
+          const tmuxKillSessionRegex = new RegExp(`tmux\\s+kill-session\\s+(?:-t\\s+)["']?(${NAME})["']?`, 'i');
+          const tmuxHasSessionRegex = new RegExp(`tmux\\s+has-session\\s+(?:-t\\s+)["']?(${NAME})["']?`, 'i');
           
           // 检查是否需要在执行前捕获tmux会话内容（用于比较前后差异）
           let beforeCapture: CommandResult | undefined;
@@ -529,8 +591,10 @@ export class SshMCP {
 
                   if (checkResult?.stdout) {
                     const [panePid, currentCommand] = checkResult.stdout.trim().split(' ');
-                    
-                    if (panePid) {
+
+                    // panePid 来自远程输出，会被拼进 ps / pgrep 命令。
+                    // 只接受纯数字，否则畸形或被操纵的 pane_pid 就成了注入点。
+                    if (panePid && /^\d+$/.test(panePid)) {
                       // 获取进程状态
                       const processResult: CommandResult = await this.sshService.executeCommand(
                         connectionId,
@@ -869,8 +933,9 @@ export class SshMCP {
                         
                         if (checkResult?.stdout) {
                           const [panePid, currentCommand] = checkResult.stdout.trim().split(' ');
-                          
-                          if (panePid) {
+
+                          // 同上：只接受纯数字的 pid
+                          if (panePid && /^\d+$/.test(panePid)) {
                             // 获取进程状态
                             const processResult = await this.sshService.executeCommand(
                               connectionId,
@@ -1249,48 +1314,35 @@ export class SshMCP {
           // 上传文件并获取传输ID
           const transferInfo = await this.sshService.uploadFile(connectionId, localPath, remotePath);
           const transferId = transferInfo.id;
-          
-          // 监听传输进度
-          const unsubscribe = this.sshService.onTransferProgress((info: FileTransferInfo) => {
-            // 只在进度变化大于5%时发送更新，避免过多事件
-            if (info.progress % 5 === 0 || info.status === 'completed' || info.status === 'failed') {
-              (this.server as any).sendEvent('file_transfer_progress', {
-                transferId: info.id,
-                progress: Math.round(info.progress),
-                status: info.status,
-                human: `文件传输 ${info.id} - ${info.status}: ${Math.round(info.progress)}% (${this.formatFileSize(info.bytesTransferred)}/${this.formatFileSize(info.size)})`
-              });
-            }
-          });
-          
-          try {
-            // 获取最终结果
-            const result = this.sshService.getTransferInfo(transferId);
-            
-            if (result && result.status === 'failed') {
-              return {
-                content: [{
-                  type: "text",
-                  text: `文件上传失败: ${result.error || '未知错误'}`
-                }],
-                isError: true,
-                transferId
-              };
-            }
-            
-            const fileName = path.basename(localPath);
-            
+
+          // 这里原本订阅 onTransferProgress 只为调用 server.sendEvent 推送进度，
+          // 但 MCP SDK 上并不存在 sendEvent（被 `as any` 掩盖），每次回调都抛
+          // TypeError 并被 index.ts 的 uncaughtException 吞掉。
+          // 且 server 主动推送的通知不会进入模型上下文，推了也没人读。
+          // uploadFile 本身是 await 的，返回即已完成，进度订阅没有意义；
+          // 需要查询进度的场景走 getFileTransferStatus 工具。
+          const result = this.sshService.getTransferInfo(transferId);
+
+          if (result && result.status === 'failed') {
             return {
               content: [{
                 type: "text",
-                text: `文件 "${fileName}" 上传成功\n本地路径: ${localPath}\n远程路径: ${remotePath}`
+                text: `文件上传失败: ${result.error || '未知错误'}`
               }],
+              isError: true,
               transferId
             };
-          } finally {
-            // 确保始终取消订阅
-            unsubscribe();
           }
+
+          const fileName = path.basename(localPath);
+
+          return {
+            content: [{
+              type: "text",
+              text: `文件 "${fileName}" 上传成功\n本地路径: ${localPath}\n远程路径: ${remotePath}`
+            }],
+            transferId
+          };
         } catch (error) {
           return {
             content: [{
@@ -1355,48 +1407,31 @@ export class SshMCP {
           // 下载文件并获取传输ID
           const transferInfo = await this.sshService.downloadFile(connectionId, remotePath, savePath);
           const transferId = transferInfo.id;
-          
-          // 监听传输进度
-          const unsubscribe = this.sshService.onTransferProgress((info: FileTransferInfo) => {
-            // 只在进度变化大于5%时发送更新，避免过多事件
-            if (info.progress % 5 === 0 || info.status === 'completed' || info.status === 'failed') {
-              (this.server as any).sendEvent('file_transfer_progress', {
-                transferId: info.id,
-                progress: Math.round(info.progress),
-                status: info.status,
-                human: `文件传输 ${info.id} - ${info.status}: ${Math.round(info.progress)}% (${this.formatFileSize(info.bytesTransferred)}/${this.formatFileSize(info.size)})`
-              });
-            }
-          });
-          
-          try {
-            // 获取最终结果
-            const result = this.sshService.getTransferInfo(transferId);
-            
-            if (result && result.status === 'failed') {
-              return {
-                content: [{
-                  type: "text",
-                  text: `文件下载失败: ${result.error || '未知错误'}`
-                }],
-                isError: true,
-                transferId
-              };
-            }
-            
-            const fileName = path.basename(remotePath);
-            
+
+          // 同 uploadFile：移除基于 sendEvent 的进度订阅（该方法在 SDK 中不存在）。
+          // downloadFile 已 await，返回即完成；进度查询走 getFileTransferStatus。
+          const result = this.sshService.getTransferInfo(transferId);
+
+          if (result && result.status === 'failed') {
             return {
               content: [{
                 type: "text",
-                text: `文件 "${fileName}" 下载成功\n远程路径: ${remotePath}\n本地路径: ${savePath}`
+                text: `文件下载失败: ${result.error || '未知错误'}`
               }],
+              isError: true,
               transferId
             };
-          } finally {
-            // 确保始终取消订阅
-            unsubscribe();
           }
+
+          const fileName = path.basename(remotePath);
+
+          return {
+            content: [{
+              type: "text",
+              text: `文件 "${fileName}" 下载成功\n远程路径: ${remotePath}\n本地路径: ${savePath}`
+            }],
+            transferId
+          };
         } catch (error) {
           return {
             content: [{
@@ -1478,57 +1513,22 @@ export class SshMCP {
           
           // 获取传输信息
           const transferInfos = transferIds.map(id => this.sshService.getTransferInfo(id)).filter(Boolean) as FileTransferInfo[];
-          
-          // 设置批量传输进度监听
-          const listeners: (() => void)[] = [];
-          
-          for (const transferId of transferIds) {
-            const unsubscribe = this.sshService.onTransferProgress((info: FileTransferInfo) => {
-              if (info.id === transferId && (info.progress % 10 === 0 || info.status === 'completed' || info.status === 'failed')) {
-                (this.server as any).sendEvent('batch_transfer_progress', {
-                  transferId: info.id,
-                  progress: Math.round(info.progress),
-                  status: info.status,
-                  direction: 'upload',
-                  human: `批量上传 - 文件: ${path.basename(info.localPath)} - ${info.status}: ${Math.round(info.progress)}%`
-                });
-              }
-            });
-            
-            listeners.push(unsubscribe);
-          }
-          
-          try {
-            // 等待所有传输完成
-            await new Promise<void>((resolve) => {
-              const checkInterval = setInterval(() => {
-                const allDone = transferIds.every(id => {
-                  const info = this.sshService.getTransferInfo(id);
-                  return info && (info.status === 'completed' || info.status === 'failed');
-                });
-                
-                if (allDone) {
-                  clearInterval(checkInterval);
-                  resolve();
-                }
-              }, 500);
-            });
-            
-            // 计算成功和失败的数量
-            const successCount = transferInfos.filter(info => info.status === 'completed').length;
-            const failedCount = transferInfos.filter(info => info.status === 'failed').length;
-            
-            return {
-              content: [{
-                type: "text",
-                text: `批量上传完成\n成功: ${successCount}个文件\n失败: ${failedCount}个文件`
-              }],
-              transferIds
-            };
-          } finally {
-            // 清理所有监听器
-            listeners.forEach(unsubscribe => unsubscribe());
-          }
+
+          // 移除基于 sendEvent 的进度订阅（该方法在 SDK 中不存在，每次回调都抛异常）。
+          // 单个文件的进度可通过 getFileTransferStatus 查询。
+          await this.waitForTransfers(transferIds);
+
+          // 计算成功和失败的数量
+          const successCount = transferInfos.filter(info => info.status === 'completed').length;
+          const failedCount = transferInfos.filter(info => info.status === 'failed').length;
+
+          return {
+            content: [{
+              type: "text",
+              text: `批量上传完成\n成功: ${successCount}个文件\n失败: ${failedCount}个文件`
+            }],
+            transferIds
+          };
         } catch (error) {
           return {
             content: [{
@@ -1630,57 +1630,22 @@ export class SshMCP {
           
           // 获取传输信息
           const transferInfos = transferIds.map(id => this.sshService.getTransferInfo(id)).filter(Boolean) as FileTransferInfo[];
-          
-          // 设置批量传输进度监听
-          const listeners: (() => void)[] = [];
-          
-          for (const transferId of transferIds) {
-            const unsubscribe = this.sshService.onTransferProgress((info: FileTransferInfo) => {
-              if (info.id === transferId && (info.progress % 10 === 0 || info.status === 'completed' || info.status === 'failed')) {
-                (this.server as any).sendEvent('batch_transfer_progress', {
-                  transferId: info.id,
-                  progress: Math.round(info.progress),
-                  status: info.status,
-                  direction: 'download',
-                  human: `批量下载 - 文件: ${path.basename(info.remotePath)} - ${info.status}: ${Math.round(info.progress)}%`
-                });
-              }
-            });
-            
-            listeners.push(unsubscribe);
-          }
-          
-          try {
-            // 等待所有传输完成
-            await new Promise<void>((resolve) => {
-              const checkInterval = setInterval(() => {
-                const allDone = transferIds.every(id => {
-                  const info = this.sshService.getTransferInfo(id);
-                  return info && (info.status === 'completed' || info.status === 'failed');
-                });
-                
-                if (allDone) {
-                  clearInterval(checkInterval);
-                  resolve();
-                }
-              }, 500);
-            });
-            
-            // 计算成功和失败的数量
-            const successCount = transferInfos.filter(info => info.status === 'completed').length;
-            const failedCount = transferInfos.filter(info => info.status === 'failed').length;
-            
-            return {
-              content: [{
-                type: "text",
-                text: `批量下载完成\n成功: ${successCount}个文件\n失败: ${failedCount}个文件`
-              }],
-              transferIds
-            };
-          } finally {
-            // 清理所有监听器
-            listeners.forEach(unsubscribe => unsubscribe());
-          }
+
+          // 移除基于 sendEvent 的进度订阅（该方法在 SDK 中不存在，每次回调都抛异常）。
+          // 单个文件的进度可通过 getFileTransferStatus 查询。
+          await this.waitForTransfers(transferIds);
+
+          // 计算成功和失败的数量
+          const successCount = transferInfos.filter(info => info.status === 'completed').length;
+          const failedCount = transferInfos.filter(info => info.status === 'failed').length;
+
+          return {
+            content: [{
+              type: "text",
+              text: `批量下载完成\n成功: ${successCount}个文件\n失败: ${failedCount}个文件`
+            }],
+            transferIds
+          };
         } catch (error) {
           return {
             content: [{
@@ -2030,39 +1995,27 @@ export class SshMCP {
         try {
           const { connectionId, rows, cols, term } = params;
           const sessionId = await this.sshService.createTerminalSession(connectionId, { rows, cols, term });
-          
-          // 设置终端数据监听器
-          const unsubscribeData = this.sshService.onTerminalData((event) => {
-            if (event.sessionId === sessionId) {
-              // 应用输出长度限制
-              const limitedData = this.limitOutputLength(event.data);
 
-              (this.server as any).sendEvent('terminal_data', {
-                sessionId: event.sessionId,
-                data: limitedData,
-                human: limitedData
-              });
-            }
+          // 等待 shell 打出第一个提示符，让调用方一开始就看到终端状态，
+          // 不必先盲写一次再读。
+          const initial = await this.sshService.readTerminalStable(sessionId, {
+            timeout: 3000,
+            quietMs: 300
           });
-          
-          // 当终端关闭时，取消订阅
-          const unsubscribeClose = this.sshService.onTerminalClose((event) => {
-            if (event.sessionId === sessionId) {
-              unsubscribeData();
-              unsubscribeClose(); // 也取消自身的订阅
-              (this.server as any).sendEvent('terminal_closed', {
-                sessionId: event.sessionId,
-                human: `终端会话 ${sessionId} 已关闭`
-              });
-            }
-          });
-          
+
+          let text = `已创建终端会话 ${sessionId}\n`;
+          text += `游标: ${initial.cursor}（下次 readTerminal 传 since=${initial.cursor} 可只取新增内容）\n`;
+          if (initial.data) {
+            text += `\n当前终端内容:\n${this.limitOutputLength(initial.data)}`;
+          }
+
           return {
             content: [{
               type: "text",
-              text: `已创建终端会话 ${sessionId}`
+              text
             }],
-            sessionId
+            sessionId,
+            cursor: initial.cursor
           };
         } catch (error) {
           const errorMessage = error instanceof Error ? error.message : String(error);
@@ -2077,32 +2030,173 @@ export class SshMCP {
         }
       }
     );
+
+    // 读取终端输出
+    this.server.tool(
+      "mcp_ssh_mcp_readTerminal",
+      "Reads output from an interactive terminal session. Pass the cursor from a previous call to read only new data.",
+      {
+        sessionId: z.string(),
+        since: z.number().optional(),
+        timeout: z.number().optional(),
+        waitForOutput: z.boolean().optional().default(true)
+      },
+      async ({ sessionId, since, timeout, waitForOutput }) => {
+        try {
+          const result = waitForOutput
+            ? await this.sshService.readTerminalStable(sessionId, { since, timeout })
+            : { ...this.sshService.readTerminal(sessionId, since), timedOut: false };
+
+          let text = '';
+
+          if (result.droppedBytes > 0) {
+            text += `注意: 缓冲区上限导致最早的 ${result.droppedBytes} 字节已被丢弃\n`;
+          }
+
+          if (!result.isActive) {
+            text += `会话已结束`;
+            if (typeof result.exitCode === 'number') {
+              text += `（退出码 ${result.exitCode}）`;
+            }
+            text += '\n';
+          } else if (result.timedOut) {
+            text += `等待超时，终端仍有输出或处于阻塞状态（返回目前已收到的内容）\n`;
+          }
+
+          if (text) text += '\n';
+
+          text += result.data
+            ? this.limitOutputLength(result.data)
+            : '（无新输出）';
+
+          text += `\n\n游标: ${result.cursor}`;
+
+          return {
+            content: [{
+              type: "text",
+              text
+            }],
+            cursor: result.cursor,
+            isActive: result.isActive
+          };
+        } catch (error) {
+          return {
+            content: [{
+              type: "text",
+              text: `读取终端输出时出错: ${error instanceof Error ? error.message : String(error)}`
+            }],
+            isError: true
+          };
+        }
+      }
+    );
     
     // 向终端写入数据
     this.server.tool(
       "mcp_ssh_mcp_writeToTerminal",
-      "Writes data to an interactive terminal session.",
+      "Writes data to an interactive terminal session and returns the resulting output.",
       {
         sessionId: z.string(),
-        data: z.string()
+        data: z.string(),
+        timeout: z.number().optional(),
+        waitForOutput: z.boolean().optional().default(true)
       },
       async (params) => {
         try {
-          const { sessionId, data } = params;
+          const { sessionId, data, timeout, waitForOutput } = params;
+
+          // 先记下当前游标，写入后只读回本次产生的新输出
+          const before = this.sshService.readTerminal(sessionId);
           const success = await this.sshService.writeToTerminal(sessionId, data);
-          
+
+          if (!success) {
+            return {
+              content: [{
+                type: "text",
+                text: `数据发送失败: 会话 ${sessionId} 不存在或已关闭`
+              }],
+              isError: true
+            };
+          }
+
+          if (!waitForOutput) {
+            return {
+              content: [{
+                type: "text",
+                text: `数据已发送到终端 ${sessionId}`
+              }],
+              success: true,
+              cursor: before.cursor
+            };
+          }
+
+          // 写入后等待终端响应稳定，把回显直接带回去，
+          // 免去调用方再单独发一次 readTerminal。
+          const result = await this.sshService.readTerminalStable(sessionId, {
+            since: before.cursor,
+            timeout
+          });
+
+          let text = '';
+          if (!result.isActive) {
+            text += `会话已结束`;
+            if (typeof result.exitCode === 'number') {
+              text += `（退出码 ${result.exitCode}）`;
+            }
+            text += '\n\n';
+          } else if (result.timedOut) {
+            text += `等待超时，终端可能仍在输出或等待输入（返回目前已收到的内容）\n\n`;
+          }
+
+          text += result.data
+            ? this.limitOutputLength(result.data)
+            : '（无输出）';
+          text += `\n\n游标: ${result.cursor}`;
+
           return {
             content: [{
               type: "text",
-              text: success ? `数据已发送到终端 ${sessionId}` : `数据发送失败`
+              text
             }],
-            success
+            success: true,
+            cursor: result.cursor,
+            isActive: result.isActive
           };
         } catch (error) {
           return {
             content: [{
               type: "text",
               text: `向终端写入数据时出错: ${error instanceof Error ? error.message : String(error)}`
+            }],
+            isError: true
+          };
+        }
+      }
+    );
+
+    // 关闭终端会话
+    this.server.tool(
+      "mcp_ssh_mcp_closeTerminalSession",
+      "Closes an interactive terminal session and releases its resources.",
+      {
+        sessionId: z.string()
+      },
+      async ({ sessionId }) => {
+        try {
+          const success = await this.sshService.closeTerminalSession(sessionId);
+          return {
+            content: [{
+              type: "text",
+              text: success
+                ? `终端会话 ${sessionId} 已关闭`
+                : `终端会话 ${sessionId} 不存在或已关闭`
+            }]
+          };
+        } catch (error) {
+          return {
+            content: [{
+              type: "text",
+              text: `关闭终端会话时出错: ${error instanceof Error ? error.message : String(error)}`
             }],
             isError: true
           };

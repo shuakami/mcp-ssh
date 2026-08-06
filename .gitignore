@@ -9,4 +9,6 @@ dist/
 *.sqlite
 *.dat
 credentials.json
-connections.json 
+connections.json
+.mcp-ssh.lock 
+PR_DESCRIPTION.md

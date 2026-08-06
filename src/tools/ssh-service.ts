@@ -10,6 +10,7 @@ import { EventEmitter } from 'events';
 import * as net from 'net';
 import { Client as SSHClient, ConnectConfig, SFTPWrapper } from 'ssh2';
 import { SSHExecCommandResponse, SSHExecOptions } from 'node-ssh';
+import { verifyHostKey, rejectionMessage } from './known-hosts.js';
 
 // 连接配置
 export interface SSHConnectionConfig {
@@ -18,6 +19,9 @@ export interface SSHConnectionConfig {
   username: string;
   password?: string;
   privateKey?: string;
+  // 私钥的来源路径。当调用方给的是文件路径时记在这里，
+  // 持久化时只存路径不存内容（见 saveConnection）。
+  privateKeyPath?: string;
   passphrase?: string;
   keepaliveInterval?: number;
   readyTimeout?: number;
@@ -46,6 +50,8 @@ export interface SSHConnection {
   client?: NodeSSH;
   tags?: string[];
   currentDirectory?: string;
+  // 首次见到该主机的密钥时记下的提示，供 connect 工具告知调用方
+  hostKeyNotice?: string;
 }
 
 // 执行命令结果
@@ -59,6 +65,7 @@ export interface CommandResult {
 export interface BackgroundTaskResult {
   id: string;
   output: string;
+  droppedBytes?: number;   // 输出超限时被丢弃的头部字节数
   isRunning: boolean;
   exitCode?: number;
   error?: string;
@@ -71,6 +78,9 @@ interface BackgroundTask {
   client: NodeSSH;
   process: any; // SSHExecCommandResponse类型，但实际上可能包含附加属性
   output: string;
+  droppedBytes?: number;   // 因超过 MAX_TASK_OUTPUT 而被丢弃的头部字节数
+  checkInterval?: NodeJS.Timeout;  // 轮询任务是否结束的定时器
+  timeoutTimer?: NodeJS.Timeout;   // 兜底超时定时器
   isRunning: boolean;
   exitCode?: number;
   error?: string;
@@ -132,7 +142,18 @@ export interface TerminalSession {
   isActive: boolean;
   startTime: Date;
   lastActivity: Date;
-  sudoPasswordPrompt: boolean;
+  // sudo 密码自动填充的「武装」时刻。只有调用方自己写入了 sudo 命令后，
+  // 这里才会被置上；密码填充仅在此后的短时间窗内允许发生。
+  sudoArmedAt?: number;
+  // 环形缓冲：PTY 持续吐出的数据先落在这里，等 readTerminal 来取。
+  // 没有它的话数据 emit 完就没了，调用方永远读不到终端回显。
+  buffer: string;
+  // 已因超出上限而丢弃的字节数，读取时如实告知调用方
+  droppedBytes: number;
+  // 单调递增的游标，供调用方增量读取（只取上次之后的新数据）
+  cursor: number;
+  // 会话结束时的退出信息，读取时一并返回
+  exitCode?: number;
 }
 
 // 终端数据事件
@@ -148,6 +169,41 @@ export interface TerminalResizeEvent {
   cols: number;
 }
 
+// 后台任务输出的内存上限（字节）。超出后保留尾部，丢弃头部，
+// 避免 tail -f 一类的长跑命令把输出无限累积到堆里。
+const MAX_TASK_OUTPUT = parseInt(process.env.MAX_TASK_OUTPUT || '262144'); // 256KB
+// 已结束的后台任务在内存中的保留时长，超时后连同输出一起回收
+const FINISHED_TASK_TTL = parseInt(process.env.FINISHED_TASK_TTL || '600000'); // 10分钟
+// 单个终端会话缓冲区的内存上限（字节）。超出后保留尾部丢弃头部，
+// 这与终端的语义一致：top/vim 这类程序你关心的永远是最新画面。
+const MAX_TERMINAL_BUFFER = parseInt(process.env.MAX_TERMINAL_BUFFER || '131072'); // 128KB
+
+// sudo 密码自动填充的时间窗（毫秒）。调用方写入 sudo 命令后，
+// 只有这段时间内出现的密码提示才会被自动应答。
+const SUDO_ARM_WINDOW = parseInt(process.env.SUDO_ARM_WINDOW || '15000'); // 15秒
+
+// 判断一次写入是否构成 sudo 调用。要求 sudo 作为命令词出现
+// （行首，或在 | ; & 等分隔符之后），避免 `git commit -m "... sudo ..."`
+// 这类把 sudo 当普通文本的命令误武装。
+const SUDO_INVOCATION = /(?:^|[\n;|&]|&&|\|\|)\s*(?:[A-Za-z_][\w]*=\S*\s+)*sudo(?:\s|$)/;
+
+// 同上，但带捕获组且为全局匹配，用于把命令位置上的 sudo 改写为 sudo -S。
+// 捕获组保留前导分隔符，替换时用 $1 原样写回。
+//
+// 已知局限：形如 `echo x | sudo tee f` 的命令，sudo 的 stdin 已被管道占用，
+// 密码送不进去，sudo 会以「no tty present」失败。这类命令需要调用方改用
+// `sudo tee f <<< x` 之类不占用 stdin 的写法。原实现在这种情况下会把管道
+// 里的数据当成密码，属于静默错误，现在至少是一个带明确信息的失败。
+const SUDO_WORD = /((?:^|[\n;|&])\s*(?:[A-Za-z_][\w]*=\S*\s+)*)sudo(?=\s|$)/g;
+
+// 真正的 sudo 密码提示。OpenSSH/sudo 的提示格式是固定的，
+// 不接受裸的 'Password:'——那是误报的主要来源。
+const SUDO_PROMPT = /(?:\[sudo\] password for [^:]*:|\[sudo\] 密码：|Sorry, try again\.)\s*$/;
+
+// 文件传输的停滞超时（毫秒）。SFTP 流在半开 TCP 等情况下会静默卡住，
+// 既不 close 也不 error，没有这个看门狗就会永久挂住调用与内存。
+const TRANSFER_STALL_TIMEOUT = parseInt(process.env.TRANSFER_STALL_TIMEOUT || '120000'); // 2分钟
+
 // 服务类
 export class SSHService {
   private connections: Map<string, SSHConnection> = new Map();
@@ -158,6 +214,8 @@ export class SSHService {
   private serviceReady: boolean = false;
   private serviceReadyPromise: Promise<void>;
   private isDocker: boolean = false;
+  // 容器模式的明文凭证警告只打一次，避免刷屏
+  private dockerCredentialWarned: boolean = false;
   
   // 后台任务管理
   private backgroundTasks: Map<string, BackgroundTask> = new Map();
@@ -172,25 +230,43 @@ export class SSHService {
   
   // 事件发射器
   private eventEmitter: EventEmitter = new EventEmitter();
-  
+
   // 文件传输管理
   private fileTransfers: Map<string, FileTransferInfo> = new Map();
   
   // 终端会话管理
   private terminalSessions: Map<string, TerminalSession> = new Map();
+
+  // 重连状态：每个连接至多一个在途的重连链，防止递归自增殖
+  private reconnectState: Map<string, { timer?: NodeJS.Timeout, attempts: number }> = new Map();
   
   constructor() {
     this.dataPath = process.env.SSH_DATA_PATH || path.join(os.homedir(), '.mcp-ssh');
     this.isDocker = process.env.IS_DOCKER === 'true';
-    
-    // 创建数据目录（如果不存在）
+
+    // 创建数据目录（如果不存在）。
+    // 明确指定 0700：这里存的是连接信息，容器模式下还包括明文凭证，
+    // 而 mkdirSync 不指定 mode 时是 0777 & ~umask（通常 0755），
+    // 多用户机器上其他用户可以读。
     if (!fs.existsSync(this.dataPath)) {
-      fs.mkdirSync(this.dataPath, { recursive: true });
+      fs.mkdirSync(this.dataPath, { recursive: true, mode: 0o700 });
+    } else {
+      // 已存在的目录也收紧一次，处理旧版本留下的宽松权限。
+      // Windows 上 chmod 基本无效，失败不影响运行。
+      try {
+        fs.chmodSync(this.dataPath, 0o700);
+      } catch {
+        // 忽略：Windows 或无权限时不阻断启动
+      }
     }
-    
+
     // 初始化数据库
     this.serviceReadyPromise = this.initDatabase();
-    
+
+    // 每个终端会话会注册一对监听器，默认上限 10 太低会刷警告；
+    // 设为一个较大但有限的值，真正的泄漏仍会告警。
+    this.eventEmitter.setMaxListeners(100);
+
     // 设置定期清理任务
     this.setupCleanupTasks();
   }
@@ -242,13 +318,22 @@ export class SSHService {
   // 加载保存的连接
   private async loadSavedConnections(): Promise<void> {
     if (!this.connectionCollection) return;
-    
+
     const savedConnections = this.connectionCollection.find();
-    
+    let migrated = 0;
+
     for (const conn of savedConnections) {
       // 不加载密码，只保留配置
       const { id, name, config, lastUsed, tags } = conn;
-      
+
+      // 迁移：早期版本把私钥 PEM 明文写进了这个库。
+      // 遇到就地清除，避免它继续留在磁盘上。
+      if (config && config.privateKey) {
+        delete config.privateKey;
+        this.connectionCollection.update(conn);
+        migrated++;
+      }
+
       // 创建连接对象
       this.connections.set(id, {
         id,
@@ -257,7 +342,7 @@ export class SSHService {
           host: config.host,
           port: config.port || parseInt(process.env.DEFAULT_SSH_PORT || '22'),
           username: config.username,
-          privateKey: config.privateKey,
+          privateKeyPath: config.privateKeyPath,
           keepaliveInterval: 60000,
           readyTimeout: parseInt(process.env.CONNECTION_TIMEOUT || '10000')
         },
@@ -265,6 +350,14 @@ export class SSHService {
         lastUsed: lastUsed ? new Date(lastUsed) : undefined,
         tags
       });
+    }
+
+    if (migrated > 0) {
+      console.error(
+        `已从连接库中清除 ${migrated} 条明文私钥记录（旧版本遗留）。` +
+        `如需继续使用私钥认证，请在 connect 时传入私钥路径。`
+      );
+      if (this.db) this.db.saveDatabase();
     }
   }
   
@@ -292,7 +385,14 @@ export class SSHService {
         host: connection.config.host,
         port: connection.config.port,
         username: connection.config.username,
-        privateKey: connection.config.privateKey
+        // 只持久化私钥的路径，绝不写入私钥内容。
+        //
+        // 原来这里存的是 connection.config.privateKey，即完整的 PEM。
+        // LokiJS 默认适配器用 fs.writeFile 写明文 JSON 且不指定 mode，
+        // 落盘权限是 0644、目录 0755，多用户机器上人人可读。
+        // passphrase 又单独存在 keytar 里，所以对未加密的私钥而言
+        // 这等于完整泄露。
+        privateKeyPath: connection.config.privateKeyPath
       },
       lastUsed: connection.lastUsed ? connection.lastUsed.toISOString() : new Date().toISOString(),
       tags: connection.tags || []
@@ -313,6 +413,20 @@ export class SSHService {
   
   private async saveCredentials(id: string, password?: string, passphrase?: string): Promise<void> {
     if (this.isDocker) {
+      // 容器内没有系统钥匙串可用，退化为文件存储。
+      //
+      // 注意这是明文：LokiJS 用明文 JSON 落盘。原实现对此没有任何提示，
+      // 用户不会意识到密码正躺在一个可被 docker cp / 卷快照读取的文件里。
+      // 至少要说出来；数据目录本身已收紧为 0700（见构造函数）。
+      if (!this.dockerCredentialWarned) {
+        this.dockerCredentialWarned = true;
+        console.error(
+          '警告: 容器环境下无系统钥匙串，凭证以明文形式存储于 ' +
+          `${path.join(this.dataPath, 'ssh-connections.db')}。` +
+          '请确保该卷不被共享或纳入镜像。'
+        );
+      }
+
       await this.ensureReady();
       if (!this.credentialCollection) return;
 
@@ -358,7 +472,9 @@ export class SSHService {
   }
   
   // 连接到SSH服务器
-  public async connect(config: SSHConnectionConfig, name?: string, rememberPassword: boolean = false, tags?: string[]): Promise<SSHConnection> {
+  // isReconnecting: 由重连链内部调用时为 true，此时失败不再调度新的重连，
+  // 避免 connect -> scheduleReconnect -> connect 的递归自增殖。
+  public async connect(config: SSHConnectionConfig, name?: string, rememberPassword: boolean = false, tags?: string[], isReconnecting: boolean = false): Promise<SSHConnection> {
     await this.ensureReady();
     
     const connectionId = this.generateConnectionId(config);
@@ -387,8 +503,26 @@ export class SSHService {
       };
       this.connections.set(connectionId, connection);
     }
-    
+
+    // 本次连接观察到的主机密钥情况。声明在 try 之外，
+    // 因为拒绝信息要在 catch 里用来替换 ssh2 笼统的错误。
+    let hostKeyNotice: string | undefined;
+    let hostKeyRejection: string | undefined;
+
     try {
+      // 私钥内容不再持久化，只存路径。重连或使用已保存的连接时，
+      // 从路径重新读取，使私钥认证在进程重启后依然可用。
+      if (!config.privateKey && config.privateKeyPath) {
+        try {
+          config.privateKey = fs.readFileSync(config.privateKeyPath, 'utf8');
+        } catch (error) {
+          throw new Error(
+            `读取私钥失败（${config.privateKeyPath}）: ` +
+            `${error instanceof Error ? error.message : String(error)}`
+          );
+        }
+      }
+
       // 如果没有提供密码，尝试从keytar获取
       if (!config.password && !config.privateKey) {
         const savedCredentials = await this.getCredentials(connectionId);
@@ -400,9 +534,20 @@ export class SSHService {
         }
       }
       
-      // 创建SSH客户端
+      // 创建SSH客户端。
+      // 若旧的 client 还在（例如断线重连），必须先释放，
+      // 否则旧的 ssh2 客户端连同其 socket 和缓冲区会永久泄漏。
+      if (connection.client) {
+        try {
+          await connection.client.dispose();
+        } catch (e) {
+          // 旧连接可能已经不可用，忽略释放错误
+        }
+        connection.client = undefined;
+      }
+
       const ssh = new NodeSSH();
-      
+
       // 连接选项
       const connectOptions = {
         host: config.host,
@@ -412,7 +557,28 @@ export class SSHService {
         privateKey: config.privateKey,
         passphrase: config.passphrase,
         keepaliveInterval: config.keepaliveInterval || 60000,
-        readyTimeout: config.readyTimeout || parseInt(process.env.CONNECTION_TIMEOUT || '10000')
+        readyTimeout: config.readyTimeout || parseInt(process.env.CONNECTION_TIMEOUT || '10000'),
+        // 主机密钥校验。不传这个回调时 ssh2 会无条件接受任何密钥
+        // （见 ssh2/lib/protocol/kex.js:1194），中间人可直接拿到明文密码。
+        // 采用 OpenSSH 的 accept-new 语义：新主机记录后放行，
+        // 已知主机密钥不符则硬失败。
+        hostVerifier: (key: Buffer): boolean => {
+          const port = config.port || parseInt(process.env.DEFAULT_SSH_PORT || '22');
+          const verdict = verifyHostKey(config.host, port, key);
+
+          if (!verdict.ok) {
+            // 这里返回 false 会让 ssh2 以一个笼统的错误中断握手，
+            // 所以先把可读的原因记下来，在 catch 中替换错误信息。
+            hostKeyRejection = rejectionMessage(config.host, port, verdict);
+            return false;
+          }
+
+          if (verdict.isNew) {
+            hostKeyNotice =
+              `已记录新主机密钥 ${verdict.fingerprint}（${config.host}:${port}）`;
+          }
+          return true;
+        }
       };
       
       // 连接
@@ -423,62 +589,155 @@ export class SSHService {
       connection.status = ConnectionStatus.CONNECTED;
       connection.lastUsed = new Date();
       connection.lastError = undefined;
+      connection.hostKeyNotice = hostKeyNotice;
+
+      // 监听底层连接的断开。
+      //
+      // 此前从不订阅这些事件，后果是网络中断后 status 永远停在 CONNECTED：
+      // 所有「未连接就拒绝」的守卫全部放行，断线重连实际上从不触发
+      // （scheduleReconnect 只在首次 connect 失败时可达），残留的终端会话、
+      // 隧道和后台任务也无从回收。
+      this.attachConnectionWatchers(connectionId, ssh);
+
       connection.currentDirectory = await this.getCurrentDirectory(connectionId);
-      
+
       // 如果配置了记住密码，保存凭据
       if (rememberPassword) {
         await this.saveCredentials(connectionId, config.password, config.passphrase);
       }
-      
+
       // 保存连接到数据库
       await this.saveConnection(connection);
-      
+
       return connection;
     } catch (error) {
+      // 主机密钥被拒时，ssh2 抛出的是笼统的握手失败信息。
+      // 换成具体原因，否则用户完全看不出发生了什么。
+      if (hostKeyRejection) {
+        connection.status = ConnectionStatus.ERROR;
+        connection.lastError = hostKeyRejection;
+        // 密钥不符属于需要人工确认的情形，重连只会反复失败
+        throw new Error(hostKeyRejection);
+      }
+
       // 连接失败
       connection.status = ConnectionStatus.ERROR;
       connection.lastError = error instanceof Error ? error.message : String(error);
       
-      // 如果配置了自动重连，尝试重连
-      if (config.reconnect && config.reconnectTries && config.reconnectTries > 0) {
+      // 如果配置了自动重连，尝试重连。
+      // 重连链内部的失败不再调度新链，否则会递归自增殖。
+      if (!isReconnecting && config.reconnect && config.reconnectTries && config.reconnectTries > 0) {
         this.scheduleReconnect(connectionId, config);
       }
-      
+
       throw error;
     }
   }
   
+  // 订阅底层 ssh2 client 的断开事件，使连接状态能反映真实情况
+  private attachConnectionWatchers(connectionId: string, ssh: NodeSSH): void {
+    const raw = (ssh as any).connection;
+    if (!raw || typeof raw.on !== 'function') return;
+
+    const onGone = (reason: string) => () => {
+      const connection = this.connections.get(connectionId);
+      // 换了新 client 的话说明已经重连过，这次事件属于旧连接，忽略
+      if (!connection || connection.client !== ssh) return;
+      if (connection.status === ConnectionStatus.DISCONNECTED) return;
+
+      console.error(`连接 ${connectionId} 已断开（${reason}）`);
+      connection.status = ConnectionStatus.DISCONNECTED;
+      connection.client = undefined;
+
+      // 断开时释放挂在这条连接上的资源，否则隧道会继续占着本地端口，
+      // 终端会话会一直留在 Map 里直到 24 小时的闲置扫描才被发现。
+      this.releaseConnectionResources(connectionId).catch(err => {
+        console.error(`清理连接 ${connectionId} 的资源时出错:`, err);
+      });
+
+      // 配置了自动重连就拉起重连链
+      const config = connection.config;
+      if (config.reconnect && config.reconnectTries && config.reconnectTries > 0) {
+        this.scheduleReconnect(connectionId, config);
+      }
+    };
+
+    raw.on('close', onGone('close'));
+    raw.on('end', onGone('end'));
+    raw.on('error', (err: Error) => {
+      const connection = this.connections.get(connectionId);
+      if (connection && connection.client === ssh) {
+        connection.lastError = err.message;
+      }
+    });
+  }
+
+  // 释放挂在某条连接上的隧道与终端会话
+  private async releaseConnectionResources(connectionId: string): Promise<void> {
+    for (const [tunnelId, tunnel] of this.tunnels.entries()) {
+      if (tunnel.config.connectionId === connectionId) {
+        await this.closeTunnel(tunnelId);
+      }
+    }
+
+    for (const [sessionId, session] of this.terminalSessions.entries()) {
+      if (session.connectionId === connectionId) {
+        await this.closeTerminalSession(sessionId);
+      }
+    }
+
+    // 该连接上的后台任务也已随之失效
+    for (const [taskId, task] of this.backgroundTasks.entries()) {
+      if (task.isRunning && task.client === this.connections.get(connectionId)?.client) {
+        this.finishTask(taskId, -1, '连接已断开');
+      }
+    }
+  }
+
   // 计划重连
+  //
+  // 原实现里 attemptReconnect 调用 this.connect()，而 connect() 失败时
+  // 又会调用 scheduleReconnect()，形成递归自增殖：每一轮失败都会派生出
+  // 新的重连链，各自持有独立的 attempts 计数器，定时器呈指数级堆积。
+  // 现在每个连接至多维持一条重连链，并通过 isReconnecting 标志阻断
+  // connect() 的失败路径再次调度。
   private scheduleReconnect(connectionId: string, config: SSHConnectionConfig): void {
     const connection = this.connections.get(connectionId);
     if (!connection) return;
-    
+
+    // 已有在途的重连链，不再新开一条
+    if (this.reconnectState.has(connectionId)) {
+      return;
+    }
+
     // 设置状态为重连中
     connection.status = ConnectionStatus.RECONNECTING;
-    
+
     // 计算重连次数和延迟
     const reconnectTries = config.reconnectTries || parseInt(process.env.RECONNECT_ATTEMPTS || '3');
     const reconnectDelay = config.reconnectDelay || 5000;
-    
-    let attempts = 0;
-    
+
+    const state: { timer?: NodeJS.Timeout, attempts: number } = { attempts: 0 };
+    this.reconnectState.set(connectionId, state);
+
     const attemptReconnect = async () => {
-      attempts++;
-      
+      state.attempts++;
+
       try {
-        // 尝试重连
-        await this.connect(config);
-        // 重连成功
-        console.log(`成功重新连接到 ${config.host}`);
+        // 标记为重连中，使 connect() 失败时不会再次调度重连
+        await this.connect(config, undefined, false, undefined, true);
+        // 重连成功，清除重连状态
+        this.clearReconnect(connectionId);
+        console.error(`成功重新连接到 ${config.host}`);
       } catch (error) {
-        // 重连失败
-        console.error(`重连尝试 ${attempts}/${reconnectTries} 失败:`, error);
-        
-        // 如果还有重连次数，继续尝试
-        if (attempts < reconnectTries) {
-          setTimeout(attemptReconnect, reconnectDelay);
+        console.error(`重连尝试 ${state.attempts}/${reconnectTries} 失败:`, error);
+
+        if (state.attempts < reconnectTries) {
+          state.timer = setTimeout(attemptReconnect, reconnectDelay);
+          if (typeof state.timer.unref === 'function') state.timer.unref();
         } else {
-          // 重连次数耗尽，设置状态为错误
+          // 重连次数耗尽，设置状态为错误并清除状态
+          this.clearReconnect(connectionId);
           const failedConnection = this.connections.get(connectionId);
           if (failedConnection) {
             failedConnection.status = ConnectionStatus.ERROR;
@@ -486,34 +745,53 @@ export class SSHService {
         }
       }
     };
-    
+
     // 开始第一次重连尝试
-    setTimeout(attemptReconnect, reconnectDelay);
+    state.timer = setTimeout(attemptReconnect, reconnectDelay);
+    if (typeof state.timer.unref === 'function') state.timer.unref();
+  }
+
+  // 清除某个连接的重连状态与定时器
+  private clearReconnect(connectionId: string): void {
+    const state = this.reconnectState.get(connectionId);
+    if (state?.timer) {
+      clearTimeout(state.timer);
+    }
+    this.reconnectState.delete(connectionId);
   }
   
   // 断开连接
   public async disconnect(connectionId: string): Promise<boolean> {
+    // 主动断开时必须取消在途的重连，否则重连链会把连接又拉起来
+    this.clearReconnect(connectionId);
+
     const connection = this.connections.get(connectionId);
     if (!connection || !connection.client) {
       return false;
     }
-    
+
     try {
+      // 先释放挂在这条连接上的隧道与终端会话。
+      // 原实现完全不碰 tunnels，断开后 net.Server 继续占着本地端口，
+      // getTunnels() 还会把它当成可用隧道列出来。
+      await this.releaseConnectionResources(connectionId);
+
       // 断开SSH连接
       await connection.client.dispose();
-      
+
       // 更新状态
       connection.status = ConnectionStatus.DISCONNECTED;
       connection.client = undefined;
-      
+
       return true;
     } catch (error) {
       console.error(`断开连接 ${connectionId} 时出错:`, error);
-      
+
       // 即使出错也要更新状态
       connection.status = ConnectionStatus.ERROR;
       connection.lastError = error instanceof Error ? error.message : String(error);
-      
+      connection.client = undefined;
+
       return false;
     }
   }
@@ -555,7 +833,7 @@ export class SSHService {
       }
 
       // 检查是否是sudo命令
-      if (command.trim().startsWith('sudo ') || command.includes(' sudo ')) {
+      if (SUDO_INVOCATION.test(command)) {
         // 尝试获取密码
         let password = connection.config.password;
         if (!password) {
@@ -563,13 +841,22 @@ export class SSHService {
           password = savedCredentials.password;
         }
 
-        // 如果有密码，使用echo密码 | sudo -S 的方式运行
+        // 密码经 stdin 送给 sudo -S，不进入命令字符串。
+        //
+        // 原实现是 `echo "${password}" | ${cmd} 2>/dev/null`，有三个问题：
+        //  1. 密码成为远程 shell 进程 argv 的一部分，/proc/<pid>/cmdline
+        //     默认全局可读，机器上任何用户 ps 一下就能拿到明文；
+        //  2. 密码在双引号内插值，含 " $ ` \ 时会破坏命令甚至造成注入；
+        //  3. 2>/dev/null 吞掉的是整条命令的 stderr，不只是 sudo 提示，
+        //     所有真实错误都被静默丢弃。
+        // 走 stdin 三个问题一并消失。
+        //
+        // 触发条件也一并收紧：原来是 includes(' sudo ')，
+        // `git commit -m "stop using sudo here"` 这种命令也会命中，
+        // 把密码贴到无关命令的命令行上。
         if (password) {
-          // 修改命令以自动提供密码
-          // 使用 -S 标志让sudo从标准输入读取密码
-          const sudoCommand = command.replace(/\bsudo\b/g, 'sudo -S');
-          // 使用echo和管道传递密码，并添加命令使sudo在用户输入时不显示
-          command = `echo "${password}" | ${sudoCommand} 2>/dev/null`;
+          command = command.replace(SUDO_WORD, '$1sudo -S -p ""');
+          execOptions.stdin = `${password}\n`;
         }
       }
       
@@ -617,7 +904,7 @@ export class SSHService {
       }
 
       // 检查是否是sudo命令
-      if (command.trim().startsWith('sudo ') || command.includes(' sudo ')) {
+      if (SUDO_INVOCATION.test(command)) {
         // 尝试获取密码
         let password = connection.config.password;
         if (!password) {
@@ -625,13 +912,22 @@ export class SSHService {
           password = savedCredentials.password;
         }
 
-        // 如果有密码，使用echo密码 | sudo -S 的方式运行
+        // 密码经 stdin 送给 sudo -S，不进入命令字符串。
+        //
+        // 原实现是 `echo "${password}" | ${cmd} 2>/dev/null`，有三个问题：
+        //  1. 密码成为远程 shell 进程 argv 的一部分，/proc/<pid>/cmdline
+        //     默认全局可读，机器上任何用户 ps 一下就能拿到明文；
+        //  2. 密码在双引号内插值，含 " $ ` \ 时会破坏命令甚至造成注入；
+        //  3. 2>/dev/null 吞掉的是整条命令的 stderr，不只是 sudo 提示，
+        //     所有真实错误都被静默丢弃。
+        // 走 stdin 三个问题一并消失。
+        //
+        // 触发条件也一并收紧：原来是 includes(' sudo ')，
+        // `git commit -m "stop using sudo here"` 这种命令也会命中，
+        // 把密码贴到无关命令的命令行上。
         if (password) {
-          // 修改命令以自动提供密码
-          // 使用 -S 标志让sudo从标准输入读取密码
-          const sudoCommand = command.replace(/\bsudo\b/g, 'sudo -S');
-          // 使用echo和管道传递密码，并添加命令使sudo在用户输入时不显示
-          command = `echo "${password}" | ${sudoCommand} 2>/dev/null`;
+          command = command.replace(SUDO_WORD, '$1sudo -S -p ""');
+          execOptions.stdin = `${password}\n`;
         }
       }
       
@@ -640,37 +936,37 @@ export class SSHService {
         .createHash('md5')
         .update(`${connectionId}:${command}:${Date.now()}`)
         .digest('hex');
-      
-      // 启动后台进程
-      const process = await connection.client.exec(command, [], {
-        cwd: execOptions.cwd,
-        stream: 'both',
-        onStdout: (chunk) => {
-          const task = this.backgroundTasks.get(taskId);
-          if (task) {
-            task.output += chunk.toString('utf8');
-            this.eventEmitter.emit('task-update', { id: taskId, output: task.output });
-          }
-        },
-        onStderr: (chunk) => {
-          const task = this.backgroundTasks.get(taskId);
-          if (task) {
-            task.output += chunk.toString('utf8');
-            this.eventEmitter.emit('task-update', { id: taskId, output: task.output });
-          }
-        }
-      });
-      
-      // 记录任务信息
+
+      // 先登记任务，再启动进程。
+      //
+      // 原顺序是 await exec(...) 之后才 backgroundTasks.set，而 onStdout /
+      // onStderr 在 exec 执行期间就会触发，此时 Map 里还没有这个 taskId，
+      // appendTaskOutput 的 `if (!task) return` 恒早退——后台任务的输出
+      // 全部被丢弃。
       const task: BackgroundTask = {
         client: connection.client,
-        process,
+        process: undefined,
         output: '',
         isRunning: true,
         startTime: new Date()
       };
-      
       this.backgroundTasks.set(taskId, task);
+
+      // 启动后台进程
+      const process = await connection.client.exec(command, [], {
+        cwd: execOptions.cwd,
+        // sudo 密码经 stdin 传入，不能漏传，否则 sudo -S 会一直等待
+        ...(execOptions.stdin ? { stdin: execOptions.stdin } : {}),
+        stream: 'both',
+        onStdout: (chunk) => {
+          this.appendTaskOutput(taskId, chunk);
+        },
+        onStderr: (chunk) => {
+          this.appendTaskOutput(taskId, chunk);
+        }
+      });
+
+      task.process = process;
       
       // 处理进程结束
       if (process && typeof process === 'object' && process.hasOwnProperty('code')) {
@@ -692,75 +988,64 @@ export class SSHService {
         // node-ssh的exec返回有可能不包含标准属性，所以使用一个定时器来检查任务是否完成
         const checkInterval = setInterval(() => {
           const currentTask = this.backgroundTasks.get(taskId);
-          if (currentTask && currentTask.isRunning && process && 
+
+          // 任务已被回收：定时器必须自杀，否则闭包会一直持有 taskId/process
+          if (!currentTask) {
+            clearInterval(checkInterval);
+            return;
+          }
+
+          if (currentTask.isRunning && process &&
               typeof process === 'object' && process.hasOwnProperty('code')) {
             // 进程已完成
-            clearInterval(checkInterval);
-            
             const code = (process as any).code;
-            currentTask.isRunning = false;
-            currentTask.exitCode = typeof code === 'number' ? code : 0;
-            currentTask.endTime = new Date();
-            
-            // 停止间隔发送
-            if (currentTask.interval) {
-              clearInterval(currentTask.interval);
-              currentTask.interval = undefined;
-            }
-            
-            this.eventEmitter.emit('task-end', { 
-              id: taskId, 
-              output: currentTask.output, 
-              exitCode: currentTask.exitCode,
-              startTime: currentTask.startTime,
-              endTime: currentTask.endTime
-            });
+            this.finishTask(taskId, typeof code === 'number' ? code : 0);
           }
         }, 1000); // 每秒检查一次
-        
+
         // 5分钟后强制结束检查，避免无限循环
-        setTimeout(() => {
-          clearInterval(checkInterval);
+        const timeoutTimer = setTimeout(() => {
           const currentTask = this.backgroundTasks.get(taskId);
           if (currentTask && currentTask.isRunning) {
-            // 强制标记为已完成
-            currentTask.isRunning = false;
-            currentTask.exitCode = -1; // 表示超时
-            currentTask.endTime = new Date();
-            
-            // 停止间隔发送
-            if (currentTask.interval) {
-              clearInterval(currentTask.interval);
-              currentTask.interval = undefined;
-            }
-            
-            this.eventEmitter.emit('task-end', { 
-              id: taskId, 
-              output: currentTask.output, 
-              exitCode: currentTask.exitCode,
-              startTime: currentTask.startTime,
-              endTime: currentTask.endTime
-            });
+            // 强制标记为已完成（-1 表示超时）
+            this.finishTask(taskId, -1);
+          } else {
+            // 任务已结束或已回收，仅确保轮询定时器被清掉
+            clearInterval(checkInterval);
           }
         }, 5 * 60 * 1000); // 5分钟
+
+        // 这两个定时器不应阻止进程退出
+        if (typeof checkInterval.unref === 'function') checkInterval.unref();
+        if (typeof timeoutTimer.unref === 'function') timeoutTimer.unref();
+
+        // 保存句柄，使任务结束/回收时能够统一清理
+        task.checkInterval = checkInterval;
+        task.timeoutTimer = timeoutTimer;
       }
       
       // 如果设置了间隔，定期发送输出
       if (options?.interval) {
         const interval = setInterval(() => {
           const task = this.backgroundTasks.get(taskId);
-          if (task && task.isRunning) {
-            this.eventEmitter.emit('task-update', { 
-              id: taskId, 
-              output: task.output,
-              isRunning: true,
-              startTime: task.startTime
-            });
-          } else {
+          // 任务不存在（已被回收）或已结束，都必须停掉定时器，
+          // 否则任务卡在 isRunning 时这个 timer 会永久跑下去。
+          if (!task || !task.isRunning) {
             clearInterval(interval);
+            if (task) task.interval = undefined;
+            return;
           }
+          this.eventEmitter.emit('task-update', {
+            id: taskId,
+            output: task.output,
+            isRunning: true,
+            startTime: task.startTime
+          });
         }, options.interval);
-        
+
+        // 允许进程在只剩这个定时器时正常退出
+        if (typeof interval.unref === 'function') interval.unref();
+
         const task = this.backgroundTasks.get(taskId);
         if (task) {
           task.interval = interval;
@@ -774,6 +1059,90 @@ export class SSHService {
     }
   }
   
+  // 统一的任务收尾：清掉全部定时器、置为结束、发出事件。
+  // 集中一处可避免旧代码中"某条路径忘了 clearInterval"的问题。
+  private finishTask(taskId: string, exitCode: number, error?: string): void {
+    const task = this.backgroundTasks.get(taskId);
+    if (!task || !task.isRunning) return;
+
+    task.isRunning = false;
+    task.exitCode = exitCode;
+    task.endTime = new Date();
+    if (error) task.error = error;
+
+    this.clearTaskTimers(task);
+
+    this.eventEmitter.emit('task-end', {
+      id: taskId,
+      output: task.output,
+      droppedBytes: task.droppedBytes,
+      exitCode: task.exitCode,
+      error: task.error,
+      startTime: task.startTime,
+      endTime: task.endTime
+    });
+  }
+
+  // 清理一个任务持有的所有定时器
+  private clearTaskTimers(task: BackgroundTask): void {
+    if (task.interval) {
+      clearInterval(task.interval);
+      task.interval = undefined;
+    }
+    if (task.checkInterval) {
+      clearInterval(task.checkInterval);
+      task.checkInterval = undefined;
+    }
+    if (task.timeoutTimer) {
+      clearTimeout(task.timeoutTimer);
+      task.timeoutTimer = undefined;
+    }
+  }
+
+  // 回收已结束且超过保留期的后台任务。
+  //
+  // 原代码从不调用 backgroundTasks.delete()，已完成的任务连同其
+  // 累积的输出永久驻留在内存里——这是内存持续增长的主因之一。
+  private cleanupFinishedTasks(): void {
+    const cutoff = Date.now() - FINISHED_TASK_TTL;
+    let removed = 0;
+
+    for (const [id, task] of this.backgroundTasks.entries()) {
+      if (!task.isRunning && task.endTime && task.endTime.getTime() < cutoff) {
+        this.clearTaskTimers(task);
+        this.backgroundTasks.delete(id);
+        removed++;
+      }
+    }
+
+    if (removed > 0) {
+      console.error(`已回收 ${removed} 个已完成的后台任务，当前剩余: ${this.backgroundTasks.size}`);
+    }
+  }
+
+  // 追加后台任务输出，并限制其内存占用。
+  //
+  // 原实现每收到一个 chunk 就把整个已累积字符串再 emit 一次，
+  // 输出量 n 时产生 O(n^2) 的内存搅动，且 output 永不截断。
+  // 现在只在超限时截断（保留尾部，因为长跑命令的尾部才是有用的），
+  // 且事件只携带增量而非全量。
+  private appendTaskOutput(taskId: string, chunk: Buffer | string): void {
+    const task = this.backgroundTasks.get(taskId);
+    if (!task) return;
+
+    const text = typeof chunk === 'string' ? chunk : chunk.toString('utf8');
+    task.output += text;
+
+    if (task.output.length > MAX_TASK_OUTPUT) {
+      const dropped = task.output.length - MAX_TASK_OUTPUT;
+      task.output = task.output.slice(-MAX_TASK_OUTPUT);
+      task.droppedBytes = (task.droppedBytes || 0) + dropped;
+    }
+
+    // 只发送增量，避免每个 chunk 拷贝一份全量输出
+    this.eventEmitter.emit('task-update', { id: taskId, chunk: text });
+  }
+
   // 停止后台任务
   public async stopBackgroundTask(taskId: string): Promise<boolean> {
     const task = this.backgroundTasks.get(taskId);
@@ -798,37 +1167,36 @@ export class SSHService {
       task.endTime = new Date();
       task.error = '任务被强制终止';
       
-      // 停止间隔发送
-      if (task.interval) {
-        clearInterval(task.interval);
-        task.interval = undefined;
-      }
-      
-      this.eventEmitter.emit('task-end', { 
-        id: taskId, 
-        output: task.output, 
+      // 停止所有定时器
+      this.clearTaskTimers(task);
+
+      this.eventEmitter.emit('task-end', {
+        id: taskId,
+        output: task.output,
+        droppedBytes: task.droppedBytes,
         error: task.error,
         startTime: task.startTime,
         endTime: task.endTime
       });
-      
+
       return true;
     } catch (error) {
       console.error(`停止后台任务 ${taskId} 时出错:`, error);
       return false;
     }
   }
-  
+
   // 获取后台任务信息
   public getBackgroundTaskInfo(taskId: string): BackgroundTaskResult | undefined {
     const task = this.backgroundTasks.get(taskId);
     if (!task) {
       return undefined;
     }
-    
+
     return {
       id: taskId,
       output: task.output,
+      droppedBytes: task.droppedBytes,
       isRunning: task.isRunning,
       exitCode: task.exitCode,
       error: task.error,
@@ -836,15 +1204,16 @@ export class SSHService {
       endTime: task.endTime
     };
   }
-  
+
   // 获取所有后台任务
   public getAllBackgroundTasks(): BackgroundTaskResult[] {
     const results: BackgroundTaskResult[] = [];
-    
+
     for (const [id, task] of this.backgroundTasks.entries()) {
       results.push({
         id,
         output: task.output,
+        droppedBytes: task.droppedBytes,
         isRunning: task.isRunning,
         exitCode: task.exitCode,
         error: task.error,
@@ -852,7 +1221,7 @@ export class SSHService {
         endTime: task.endTime
       });
     }
-    
+
     return results;
   }
   
@@ -892,67 +1261,102 @@ export class SSHService {
       // 保存传输信息
       this.fileTransfers.set(transferId, transferInfo);
       
-      // 使用SFTPStream上传文件
+      // 使用SFTPStream上传文件。
+      // sftp 必须在 finally 中关闭：node-ssh 的 requestSFTP 每次调用都新开一个
+      // SFTP 子系统通道且不缓存，不关的话 OpenSSH 默认 MaxSessions 10，
+      // 同一连接传十来次文件后就再也开不出通道了。
       const sftp = await connection.client.requestSFTP();
-      
-      await new Promise<void>((resolve, reject) => {
-        // 更新传输状态
-        transferInfo.status = 'in-progress';
-        this.eventEmitter.emit('transfer-start', transferInfo);
-        
-        // 创建读取流
-        const readStream = fs.createReadStream(localPath);
-        
-        // 创建写入流
-        const writeStream = sftp.createWriteStream(remotePath);
-        
-        // 跟踪传输的字节数
-        let bytesTransferred = 0;
-        
-        // 监听读取数据事件
-        readStream.on('data', (chunk: string | Buffer) => {
-          bytesTransferred += Buffer.isBuffer(chunk) ? chunk.length : Buffer.from(chunk).length;
-          
-          // 更新进度
-          transferInfo.bytesTransferred = bytesTransferred;
-          transferInfo.progress = Math.min(100, Math.round((bytesTransferred / stats.size) * 100));
-          
-          // 发出进度事件
-          this.eventEmitter.emit('transfer-progress', transferInfo);
+
+      try {
+        await new Promise<void>((resolve, reject) => {
+          // 更新传输状态
+          transferInfo.status = 'in-progress';
+          this.eventEmitter.emit('transfer-start', transferInfo);
+
+          // 创建读取流
+          const readStream = fs.createReadStream(localPath);
+
+          // 创建写入流
+          const writeStream = sftp.createWriteStream(remotePath);
+
+          // 跟踪传输的字节数
+          let bytesTransferred = 0;
+          let settled = false;
+
+          // 传输停滞看门狗。SFTP 流在半开 TCP 等情况下会静默卡住，
+          // 既不 close 也不 error，此时 status 永远停在 in-progress、
+          // endTime 永不设置，于是 fileTransfers 里的记录、两条流、
+          // 以及 await 在这里的工具调用会一起永久泄漏。
+          let watchdog: NodeJS.Timeout;
+          const resetWatchdog = () => {
+            clearTimeout(watchdog);
+            watchdog = setTimeout(() => {
+              fail(new Error(`传输停滞超过 ${TRANSFER_STALL_TIMEOUT / 1000} 秒，已中止`));
+            }, TRANSFER_STALL_TIMEOUT);
+            if (typeof watchdog.unref === 'function') watchdog.unref();
+          };
+
+          const cleanup = () => {
+            clearTimeout(watchdog);
+            readStream.destroy();
+            writeStream.destroy();
+          };
+
+          const fail = (err: Error) => {
+            if (settled) return;
+            settled = true;
+            transferInfo.status = 'failed';
+            transferInfo.error = err.message;
+            transferInfo.endTime = new Date();
+            this.eventEmitter.emit('transfer-error', transferInfo);
+            cleanup();
+            reject(err);
+          };
+
+          // 监听读取数据事件
+          readStream.on('data', (chunk: string | Buffer) => {
+            bytesTransferred += Buffer.isBuffer(chunk) ? chunk.length : Buffer.from(chunk).length;
+
+            // 更新进度
+            transferInfo.bytesTransferred = bytesTransferred;
+            transferInfo.progress = Math.min(100, Math.round((bytesTransferred / stats.size) * 100));
+
+            resetWatchdog();
+
+            // 发出进度事件
+            this.eventEmitter.emit('transfer-progress', transferInfo);
+          });
+
+          // 处理错误。两侧都要拆掉对方，否则另一条流会留在打开状态。
+          readStream.on('error', fail);
+          writeStream.on('error', fail);
+
+          // 处理完成
+          writeStream.on('close', () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(watchdog);
+            transferInfo.status = 'completed';
+            transferInfo.progress = 100;
+            transferInfo.bytesTransferred = stats.size;
+            transferInfo.endTime = new Date();
+            this.eventEmitter.emit('transfer-complete', transferInfo);
+            resolve();
+          });
+
+          resetWatchdog();
+
+          // 连接流
+          readStream.pipe(writeStream);
         });
-        
-        // 处理错误
-        readStream.on('error', (err: Error) => {
-          transferInfo.status = 'failed';
-          transferInfo.error = err.message;
-          transferInfo.endTime = new Date();
-          this.eventEmitter.emit('transfer-error', transferInfo);
-          reject(err);
-        });
-        
-        writeStream.on('error', (err: Error) => {
-          transferInfo.status = 'failed';
-          transferInfo.error = err.message;
-          transferInfo.endTime = new Date();
-          this.eventEmitter.emit('transfer-error', transferInfo);
-          readStream.destroy();
-          reject(err);
-        });
-        
-        // 处理完成
-        writeStream.on('close', () => {
-          transferInfo.status = 'completed';
-          transferInfo.progress = 100;
-          transferInfo.bytesTransferred = stats.size;
-          transferInfo.endTime = new Date();
-          this.eventEmitter.emit('transfer-complete', transferInfo);
-          resolve();
-        });
-        
-        // 连接流
-        readStream.pipe(writeStream);
-      });
-      
+      } finally {
+        try {
+          sftp.end();
+        } catch {
+          // 通道可能已因错误关闭，忽略
+        }
+      }
+
       return this.fileTransfers.get(transferId) as FileTransferInfo;
     } catch (error) {
       console.error(`上传文件到连接 ${connectionId} 时出错:`, error);
@@ -1011,95 +1415,120 @@ export class SSHService {
         fs.mkdirSync(localDir, { recursive: true });
       }
       
-      // 获取SFTP
+      // 获取SFTP。与上传同理，必须在 finally 中 end()，
+      // 否则每次下载（包括 stat 失败的下载）都永久消耗一个 SSH 通道。
       const sftp = await connection.client.requestSFTP();
-      
-      // 获取远程文件大小
-      const stats = await new Promise<any>((resolve, reject) => {
-        sftp.stat(remotePath, (err: Error | undefined, stats: any) => {
-          if (err) {
+
+      try {
+        // 获取远程文件大小
+        const stats = await new Promise<any>((resolve, reject) => {
+          sftp.stat(remotePath, (err: Error | undefined, stats: any) => {
+            if (err) {
+              reject(err);
+              return;
+            }
+            resolve(stats);
+          });
+        });
+
+        // 创建传输信息
+        const transferInfo: FileTransferInfo = {
+          id: transferId,
+          localPath,
+          remotePath,
+          direction: 'download',
+          status: 'pending',
+          progress: 0,
+          size: stats.size,
+          bytesTransferred: 0,
+          startTime: new Date()
+        };
+
+        // 保存传输信息
+        this.fileTransfers.set(transferId, transferInfo);
+
+        await new Promise<void>((resolve, reject) => {
+          // 更新传输状态
+          transferInfo.status = 'in-progress';
+          this.eventEmitter.emit('transfer-start', transferInfo);
+
+          // 创建读取流
+          const readStream = sftp.createReadStream(remotePath);
+
+          // 创建写入流
+          const writeStream = fs.createWriteStream(localPath);
+
+          // 跟踪传输的字节数
+          let bytesTransferred = 0;
+          let settled = false;
+
+          // 传输停滞看门狗，理由同 uploadFile
+          let watchdog: NodeJS.Timeout;
+          const resetWatchdog = () => {
+            clearTimeout(watchdog);
+            watchdog = setTimeout(() => {
+              fail(new Error(`传输停滞超过 ${TRANSFER_STALL_TIMEOUT / 1000} 秒，已中止`));
+            }, TRANSFER_STALL_TIMEOUT);
+            if (typeof watchdog.unref === 'function') watchdog.unref();
+          };
+
+          const fail = (err: Error) => {
+            if (settled) return;
+            settled = true;
+            transferInfo.status = 'failed';
+            transferInfo.error = err.message;
+            transferInfo.endTime = new Date();
+            this.eventEmitter.emit('transfer-error', transferInfo);
+            clearTimeout(watchdog);
+            readStream.destroy();
+            writeStream.destroy();
             reject(err);
-            return;
-          }
-          resolve(stats);
+          };
+
+          // 监听读取数据事件
+          readStream.on('data', (chunk: string | Buffer) => {
+            bytesTransferred += Buffer.isBuffer(chunk) ? chunk.length : Buffer.from(chunk).length;
+
+            // 更新进度
+            transferInfo.bytesTransferred = bytesTransferred;
+            transferInfo.progress = Math.min(100, Math.round((bytesTransferred / stats.size) * 100));
+
+            resetWatchdog();
+
+            // 发出进度事件
+            this.eventEmitter.emit('transfer-progress', transferInfo);
+          });
+
+          // 处理错误
+          readStream.on('error', fail);
+          writeStream.on('error', fail);
+
+          // 处理完成
+          writeStream.on('close', () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(watchdog);
+            transferInfo.status = 'completed';
+            transferInfo.progress = 100;
+            transferInfo.bytesTransferred = stats.size;
+            transferInfo.endTime = new Date();
+            this.eventEmitter.emit('transfer-complete', transferInfo);
+            resolve();
+          });
+
+          resetWatchdog();
+
+          // 连接流
+          readStream.pipe(writeStream);
         });
-      });
-      
-      // 创建传输信息
-      const transferInfo: FileTransferInfo = {
-        id: transferId,
-        localPath,
-        remotePath,
-        direction: 'download',
-        status: 'pending',
-        progress: 0,
-        size: stats.size,
-        bytesTransferred: 0,
-        startTime: new Date()
-      };
-      
-      // 保存传输信息
-      this.fileTransfers.set(transferId, transferInfo);
-      
-      await new Promise<void>((resolve, reject) => {
-        // 更新传输状态
-        transferInfo.status = 'in-progress';
-        this.eventEmitter.emit('transfer-start', transferInfo);
-        
-        // 创建读取流
-        const readStream = sftp.createReadStream(remotePath);
-        
-        // 创建写入流
-        const writeStream = fs.createWriteStream(localPath);
-        
-        // 跟踪传输的字节数
-        let bytesTransferred = 0;
-        
-        // 监听读取数据事件
-        readStream.on('data', (chunk: string | Buffer) => {
-          bytesTransferred += Buffer.isBuffer(chunk) ? chunk.length : Buffer.from(chunk).length;
-          
-          // 更新进度
-          transferInfo.bytesTransferred = bytesTransferred;
-          transferInfo.progress = Math.min(100, Math.round((bytesTransferred / stats.size) * 100));
-          
-          // 发出进度事件
-          this.eventEmitter.emit('transfer-progress', transferInfo);
-        });
-        
-        // 处理错误
-        readStream.on('error', (err: Error) => {
-          transferInfo.status = 'failed';
-          transferInfo.error = err.message;
-          transferInfo.endTime = new Date();
-          this.eventEmitter.emit('transfer-error', transferInfo);
-          writeStream.close();
-          reject(err);
-        });
-        
-        writeStream.on('error', (err: Error) => {
-          transferInfo.status = 'failed';
-          transferInfo.error = err.message;
-          transferInfo.endTime = new Date();
-          this.eventEmitter.emit('transfer-error', transferInfo);
-          readStream.destroy();
-          reject(err);
-        });
-        
-        // 处理完成
-        writeStream.on('close', () => {
-          transferInfo.status = 'completed';
-          transferInfo.progress = 100;
-          transferInfo.bytesTransferred = stats.size;
-          transferInfo.endTime = new Date();
-          this.eventEmitter.emit('transfer-complete', transferInfo);
-          resolve();
-        });
-        
-        // 连接流
-        readStream.pipe(writeStream);
-      });
-      
+      } finally {
+        try {
+          sftp.end();
+        } catch {
+          // 通道可能已因错误关闭，忽略
+        }
+      }
+
       return this.fileTransfers.get(transferId) as FileTransferInfo;
     } catch (error) {
       console.error(`从连接 ${connectionId} 下载文件时出错:`, error);
@@ -1305,57 +1734,81 @@ export class SSHService {
       // 设置连接处理
       server.on('connection', (socket) => {
         connections.add(socket);
-        
-        // 当连接结束时，从集合中删除
+
+        // 无论因何种原因结束，都从集合中移除，避免 Set 无限增长
+        const release = () => {
+          connections.delete(socket);
+          socket.destroy();
+        };
+
         socket.on('close', () => {
           connections.delete(socket);
         });
-        
+
         // 处理错误
         socket.on('error', (err) => {
           console.error(`隧道 ${tunnelId} 上的本地套接字错误:`, err);
-          connections.delete(socket);
-          socket.destroy();
+          release();
         });
-        
+
         // 创建到SSH服务器的连接
         const sshClient = connection.client;
         if (!sshClient) {
-          socket.destroy();
-          connections.delete(socket);
+          release();
           return;
         }
-        
-        // 创建到远程主机的连接
-        sshClient.forwardOut(
-          '127.0.0.1',
-          socket.remotePort || 0,
-          config.remoteHost,
-          config.remotePort
-        ).then((stream) => {
+
+        // forwardOut 并非 async 函数：底层连接已消失时它会**同步 throw**
+        // （node-ssh 在 ssh2 的 close 事件里把内部 connection 置为 null，
+        // 而这里的 sshClient 仍是个非 null 的 NodeSSH 对象，上面的守卫拦不住）。
+        // 同步抛出发生在 Promise 创建之前，.catch() 根本不会执行，
+        // socket 于是永久留在 Set 里、fd 不释放，异常还会逃逸成
+        // uncaughtException 被 index.ts 吞掉。必须用 try/catch 包住。
+        let forwarding: Promise<any>;
+        try {
+          forwarding = sshClient.forwardOut(
+            '127.0.0.1',
+            socket.remotePort || 0,
+            config.remoteHost,
+            config.remotePort
+          );
+        } catch (err) {
+          console.error(`为隧道 ${tunnelId} 创建转发时出错（同步）:`, err);
+          release();
+          return;
+        }
+
+        forwarding.then((stream) => {
+          // 本地 socket 可能在 forwardOut 在途期间就已关闭，
+          // 这时拿到的 SSH 通道没有对端，必须立即销毁，否则每次泄漏一条通道。
+          if (socket.destroyed) {
+            stream.destroy();
+            connections.delete(socket);
+            return;
+          }
+
           // 将本地套接字连接到SSH流
           socket.pipe(stream);
           stream.pipe(socket);
-          
+
           // 处理错误
           stream.on('error', (err: Error) => {
             console.error(`隧道 ${tunnelId} 上的SSH流错误:`, err);
-            // 确保我们从集合中移除socket
             connections.delete(socket);
             socket.destroy();
           });
-          
+
           socket.on('error', (err: Error) => {
             console.error(`隧道 ${tunnelId} 上的本地套接字错误:`, err);
             stream.destroy();
           });
-          
+
           // 处理关闭
           stream.on('close', () => {
             connections.delete(socket);
             socket.destroy();
           });
-          
+
           socket.on('close', () => {
             stream.destroy();
           });
@@ -1492,7 +1945,9 @@ export class SSHService {
         isActive: true,
         startTime: new Date(),
         lastActivity: new Date(),
-        sudoPasswordPrompt: false
+        buffer: '',
+        droppedBytes: 0,
+        cursor: 0
       };
       
       // 保存会话
@@ -1501,52 +1956,78 @@ export class SSHService {
       // 设置数据处理
       stream.on('data', (data: Buffer) => {
         const dataStr = data.toString('utf8');
-        
-        // 检测是否是sudo密码提示
-        if (dataStr.includes('[sudo] password for') || 
-            dataStr.includes('Password:') || 
-            dataStr.includes('密码：')) {
-          // 标记为sudo密码提示
-          session.sudoPasswordPrompt = true;
-          
-          // 获取密码
+
+        // sudo 密码自动填充。
+        //
+        // 原实现直接对任意终端输出做子串扫描（'Password:' 等），
+        // 于是远程任何程序只要打印出这个字面量——日志 tail、
+        // grep 结果、mysql/psql 提示符、或一个刻意构造的脚本——
+        // 就能骗到用户的明文 SSH 密码。而且误触发时 shell 回显是开的，
+        // 密码会进入会话缓冲区，经 readTerminal 流入模型上下文，
+        // 同时写进远程的 shell history。
+        //
+        // 真正的 sudo 提示必然紧跟在调用方自己发出的 sudo 命令之后。
+        // 现在以此为准：writeToTerminal 写入 sudo 时才「武装」，
+        // 且仅在窗口内、仅匹配 sudo 专用格式、仅当提示位于输出末尾时才填充。
+        if (this.shouldAnswerSudoPrompt(session, dataStr)) {
+          // 用掉即解除武装，避免同一次 sudo 之后的输出反复触发
+          session.sudoArmedAt = undefined;
+
           const connection = this.connections.get(connectionId);
           if (connection) {
-            // 尝试直接从连接获取密码
-            let password = connection.config.password;
-            if (!password) {
-              // 如果连接对象中没有密码，从凭据存储获取
-              this.getCredentials(connection.id).then(credentials => {
-                if (credentials.password) {
-                  // 自动提供密码
-                  stream.write(`${credentials.password}\n`);
-                }
-              }).catch(err => {
-                console.error('获取SSH密码时出错:', err);
-              });
+            const write = (pw?: string) => {
+              if (pw) stream.write(`${pw}\n`);
+            };
+
+            if (connection.config.password) {
+              write(connection.config.password);
             } else {
-              // 直接提供密码
-              stream.write(`${password}\n`);
+              this.getCredentials(connection.id)
+                .then(credentials => write(credentials.password))
+                .catch(err => {
+                  console.error('获取SSH密码时出错:', err);
+                });
             }
           }
         }
         
+        // 落入会话缓冲区，供 readTerminal 读取。
+        // 事件仍然发出，供进程内的订阅方使用。
+        this.appendTerminalBuffer(sessionId, dataStr);
+
         this.eventEmitter.emit('terminal-data', {
           sessionId,
           data: dataStr
         });
-        
+
         // 更新最后活动时间
         const currentSession = this.terminalSessions.get(sessionId);
         if (currentSession) {
           currentSession.lastActivity = new Date();
         }
       });
-      
+
+      // 记录远端 shell 的退出码，供 readTerminal 报告
+      stream.on('exit', (code: number | null) => {
+        const s = this.terminalSessions.get(sessionId);
+        if (s && typeof code === 'number') {
+          s.exitCode = code;
+        }
+      });
+
       // 处理流关闭
       stream.on('close', () => {
         this.closeTerminalSession(sessionId).catch(err => {
           console.error(`关闭终端会话 ${sessionId} 时出错:`, err);
+        });
+      });
+
+      // 处理流错误。若不监听，stream 的 'error' 会冒泡成 uncaughtException，
+      // 而 index.ts 吞掉异常不退出，会话就永久卡在 Map 里泄漏。
+      stream.on('error', (err: Error) => {
+        console.error(`终端会话 ${sessionId} 流错误:`, err);
+        this.closeTerminalSession(sessionId).catch(e => {
+          console.error(`清理出错的终端会话 ${sessionId} 时出错:`, e);
         });
       });
       
@@ -1557,37 +2038,146 @@ export class SSHService {
     }
   }
   
+  // 是否应当自动应答这次 sudo 密码提示。
+  //
+  // 三个条件必须同时成立，缺一不可：
+  //   1. 会话处于武装状态，且未超时——即调用方刚刚自己发了 sudo
+  //   2. 输出匹配 sudo 专用的提示格式，而非裸的 'Password:'
+  //   3. 提示位于本次输出的末尾——真实提示符不带换行结尾，
+  //      而日志里 grep 到的 'password for xxx:' 后面总还有内容
+  private shouldAnswerSudoPrompt(session: TerminalSession, chunk: string): boolean {
+    if (!session.sudoArmedAt) return false;
+    if (Date.now() - session.sudoArmedAt > SUDO_ARM_WINDOW) {
+      // 窗口已过，解除武装
+      session.sudoArmedAt = undefined;
+      return false;
+    }
+    return SUDO_PROMPT.test(chunk);
+  }
+
+  // 向会话缓冲区追加数据，超出上限时丢弃头部保留尾部
+  private appendTerminalBuffer(sessionId: string, chunk: string): void {
+    const session = this.terminalSessions.get(sessionId);
+    if (!session) return;
+
+    session.buffer += chunk;
+    session.cursor += chunk.length;
+
+    if (session.buffer.length > MAX_TERMINAL_BUFFER) {
+      const overflow = session.buffer.length - MAX_TERMINAL_BUFFER;
+      session.buffer = session.buffer.slice(overflow);
+      session.droppedBytes += overflow;
+    }
+  }
+
+  // 读取终端会话的输出。
+  //
+  // 这是 PTY 路径缺失的那一半：createTerminalSession 能开、writeToTerminal
+  // 能写，但此前没有任何工具能读回显——数据 emit 出去就丢了。
+  //
+  // since 传入上次返回的 cursor 即可增量读取；不传则返回当前缓冲区全部内容。
+  public readTerminal(sessionId: string, since?: number): {
+    data: string;
+    cursor: number;
+    droppedBytes: number;
+    isActive: boolean;
+    exitCode?: number;
+  } {
+    const session = this.terminalSessions.get(sessionId);
+    if (!session) {
+      throw new Error(`终端会话 ${sessionId} 不存在`);
+    }
+
+    let data = session.buffer;
+
+    if (typeof since === 'number' && since >= 0) {
+      // buffer 中最旧一个字节对应的全局游标
+      const bufferStart = session.cursor - session.buffer.length;
+      if (since >= session.cursor) {
+        // 调用方已读到最新位置，没有新数据
+        data = '';
+      } else if (since > bufferStart) {
+        // 请求位置仍在缓冲区内，切出增量部分
+        data = session.buffer.slice(since - bufferStart);
+      }
+      // since <= bufferStart：请求的数据已被丢弃，返回缓冲区全部内容
+    }
+
+    session.lastActivity = new Date();
+
+    return {
+      data,
+      cursor: session.cursor,
+      droppedBytes: session.droppedBytes,
+      isActive: session.isActive,
+      exitCode: session.exitCode
+    };
+  }
+
+  // 等待终端输出稳定后再读取。
+  //
+  // 交互式程序的响应不是瞬时的：writeToTerminal 返回时数据往往还在路上。
+  // 直接 readTerminal 多半读到空。这里轮询到「连续 quietMs 无新数据」
+  // 或超时为止，让调用方拿到一个完整的响应而不是半截。
+  public async readTerminalStable(
+    sessionId: string,
+    options?: { since?: number; timeout?: number; quietMs?: number }
+  ): Promise<{ data: string; cursor: number; droppedBytes: number; isActive: boolean; exitCode?: number; timedOut: boolean }> {
+    const timeout = options?.timeout ?? 5000;
+    const quietMs = options?.quietMs ?? 400;
+    const deadline = Date.now() + timeout;
+
+    let lastCursor = this.terminalSessions.get(sessionId)?.cursor ?? 0;
+    let quietSince = Date.now();
+
+    while (Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      const session = this.terminalSessions.get(sessionId);
+      // 会话在等待期间关闭：立刻返回已有数据，不必空等到超时
+      if (!session) break;
+
+      if (session.cursor !== lastCursor) {
+        lastCursor = session.cursor;
+        quietSince = Date.now();
+        continue;
+      }
+
+      if (!session.isActive) break;
+
+      // 已经安静足够久，认为输出结束
+      if (Date.now() - quietSince >= quietMs) {
+        return { ...this.readTerminal(sessionId, options?.since), timedOut: false };
+      }
+    }
+
+    // 超时或会话已关闭：仍尽力返回已收到的数据
+    const session = this.terminalSessions.get(sessionId);
+    if (!session) {
+      return { data: '', cursor: lastCursor, droppedBytes: 0, isActive: false, timedOut: false };
+    }
+    return { ...this.readTerminal(sessionId, options?.since), timedOut: true };
+  }
+
   // 向终端写入数据
   public async writeToTerminal(sessionId: string, data: string): Promise<boolean> {
     const session = this.terminalSessions.get(sessionId);
     if (!session || !session.isActive) {
       return false;
     }
-    
+
     try {
-      // 检查是否是sudo密码提示
-      if (session.sudoPasswordPrompt) {
-        // 重置sudo密码提示标志
-        session.sudoPasswordPrompt = false;
-        
-        // 获取密码
-        const connection = this.connections.get(session.connectionId);
-        if (connection) {
-          let password = connection.config.password;
-          if (!password) {
-            const savedCredentials = await this.getCredentials(connection.id);
-            password = savedCredentials.password;
-          }
-          
-          // 如果有密码，自动提供
-          if (password) {
-            // 发送密码并回车
-            session.stream.write(`${password}\n`);
-            return true;
-          }
-        }
+      // 调用方自己发起 sudo 时，为随后的密码提示开一个短时间窗。
+      //
+      // 这里原本是另一条歧路：若 sudoPasswordPrompt 被置上，
+      // 就丢弃调用方的 data 改发密码，然后 return true——
+      // 调用方以为自己的按键送到了，实际上被替换成了密码。
+      // 现在写入的永远是调用方给的数据，密码只由 stream 的
+      // 'data' 处理器在确认是 sudo 提示时应答。
+      if (SUDO_INVOCATION.test(data)) {
+        session.sudoArmedAt = Date.now();
       }
-      
+
       // 正常写入数据
       session.stream.write(data);
       
@@ -1632,7 +2222,8 @@ export class SSHService {
     if (!session) {
       return false;
     }
-    
+
+    let ok = true;
     try {
       // 结束流并移除所有事件监听器
       if (session.stream && session.isActive) {
@@ -1640,20 +2231,20 @@ export class SSHService {
         session.stream.removeAllListeners();
         // 然后关闭流
         session.stream.end();
-        session.isActive = false;
       }
-      
-      // 删除会话
-      this.terminalSessions.delete(sessionId);
-      
-      // 发出关闭事件
-      this.eventEmitter.emit('terminal-close', { sessionId });
-      
-      return true;
     } catch (error) {
       console.error(`关闭终端会话 ${sessionId} 时出错:`, error);
-      return false;
+      ok = false;
+    } finally {
+      // 无论流是否正常关闭，都必须删除会话并发出关闭事件：
+      // 订阅方依赖 terminal-close 事件退订，事件发不出去
+      // 就会导致监听器（及其闭包）永久留在 EventEmitter 上。
+      session.isActive = false;
+      this.terminalSessions.delete(sessionId);
+      this.eventEmitter.emit('terminal-close', { sessionId });
     }
+
+    return ok;
   }
   
   // 获取终端会话信息
@@ -1698,15 +2289,25 @@ export class SSHService {
   
   // 设置定期清理任务
   private setupCleanupTasks(): void {
+    // 每5分钟回收一次已结束的后台任务（连同其累积的输出）
+    const taskTimer = setInterval(() => {
+      this.cleanupFinishedTasks();
+    }, 5 * 60 * 1000); // 5分钟
+
     // 每小时清理一次已完成的传输记录
-    setInterval(() => {
+    const transferTimer = setInterval(() => {
       this.cleanupCompletedTransfers();
     }, 60 * 60 * 1000); // 1小时
-    
+
     // 每天清理一次长时间不活跃的资源
-    setInterval(() => {
+    const resourceTimer = setInterval(() => {
       this.cleanupInactiveResources();
     }, 24 * 60 * 60 * 1000); // 24小时
+
+    // 清理定时器不应阻止进程退出
+    for (const t of [taskTimer, transferTimer, resourceTimer]) {
+      if (typeof t.unref === 'function') t.unref();
+    }
   }
   
   // 清理已完成的传输记录
@@ -1722,7 +2323,7 @@ export class SSHService {
       }
     }
     
-    console.log(`已清理完成的文件传输记录，当前剩余: ${this.fileTransfers.size}`);
+    console.error(`已清理完成的文件传输记录，当前剩余: ${this.fileTransfers.size}`);
   }
   
   // 清理不活跃的资源
@@ -1745,7 +2346,7 @@ export class SSHService {
       // 未来可以添加活动时间跟踪
     }
     
-    console.log(`已清理不活跃资源，当前终端会话: ${this.terminalSessions.size}, 隧道: ${this.tunnels.size}`);
+    console.error(`已清理不活跃资源，当前终端会话: ${this.terminalSessions.size}, 隧道: ${this.tunnels.size}`);
   }
   
   // 关闭服务
@@ -1772,9 +2373,31 @@ export class SSHService {
       }
     }
     
-    // 保存数据库
+    // 保存数据库并关闭。
+    //
+    // 原来只调 saveDatabase()，有两个问题：
+    //  1. 它是回调式异步且没被等待，close() 立刻返回、进程随即 exit，
+    //     最后一次写入可能被截断；
+    //  2. autosave 的 setInterval 只有 db.close() 才会 clearInterval
+    //     （lokijs.js:1863 autosaveDisable），不关就一直吊着 event loop，
+    //     进程能退出全靠 index.ts 里显式的 process.exit()。
     if (this.db) {
-      this.db.saveDatabase();
+      const db = this.db;
+      await new Promise<void>((resolve) => {
+        // 兜底：若 lokijs 因故不回调，不能让关闭流程卡死
+        const timer = setTimeout(() => {
+          console.error('关闭数据库超时，继续退出');
+          resolve();
+        }, 5000);
+        if (typeof timer.unref === 'function') timer.unref();
+
+        db.close((err?: any) => {
+          clearTimeout(timer);
+          if (err) console.error('关闭数据库时出错:', err);
+          resolve();
+        });
+      });
+      this.db = null;
     }
   }
-} 
+}
