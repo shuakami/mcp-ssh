@@ -137,6 +137,15 @@ export interface TerminalSession {
   startTime: Date;
   lastActivity: Date;
   sudoPasswordPrompt: boolean;
+  // 环形缓冲：PTY 持续吐出的数据先落在这里，等 readTerminal 来取。
+  // 没有它的话数据 emit 完就没了，调用方永远读不到终端回显。
+  buffer: string;
+  // 已因超出上限而丢弃的字节数，读取时如实告知调用方
+  droppedBytes: number;
+  // 单调递增的游标，供调用方增量读取（只取上次之后的新数据）
+  cursor: number;
+  // 会话结束时的退出信息，读取时一并返回
+  exitCode?: number;
 }
 
 // 终端数据事件
@@ -157,6 +166,9 @@ export interface TerminalResizeEvent {
 const MAX_TASK_OUTPUT = parseInt(process.env.MAX_TASK_OUTPUT || '262144'); // 256KB
 // 已结束的后台任务在内存中的保留时长，超时后连同输出一起回收
 const FINISHED_TASK_TTL = parseInt(process.env.FINISHED_TASK_TTL || '600000'); // 10分钟
+// 单个终端会话缓冲区的内存上限（字节）。超出后保留尾部丢弃头部，
+// 这与终端的语义一致：top/vim 这类程序你关心的永远是最新画面。
+const MAX_TERMINAL_BUFFER = parseInt(process.env.MAX_TERMINAL_BUFFER || '131072'); // 128KB
 
 // 服务类
 export class SSHService {
@@ -1615,7 +1627,10 @@ export class SSHService {
         isActive: true,
         startTime: new Date(),
         lastActivity: new Date(),
-        sudoPasswordPrompt: false
+        sudoPasswordPrompt: false,
+        buffer: '',
+        droppedBytes: 0,
+        cursor: 0
       };
       
       // 保存会话
@@ -1654,18 +1669,30 @@ export class SSHService {
           }
         }
         
+        // 落入会话缓冲区，供 readTerminal 读取。
+        // 事件仍然发出，供进程内的订阅方使用。
+        this.appendTerminalBuffer(sessionId, dataStr);
+
         this.eventEmitter.emit('terminal-data', {
           sessionId,
           data: dataStr
         });
-        
+
         // 更新最后活动时间
         const currentSession = this.terminalSessions.get(sessionId);
         if (currentSession) {
           currentSession.lastActivity = new Date();
         }
       });
-      
+
+      // 记录远端 shell 的退出码，供 readTerminal 报告
+      stream.on('exit', (code: number | null) => {
+        const s = this.terminalSessions.get(sessionId);
+        if (s && typeof code === 'number') {
+          s.exitCode = code;
+        }
+      });
+
       // 处理流关闭
       stream.on('close', () => {
         this.closeTerminalSession(sessionId).catch(err => {
@@ -1689,6 +1716,110 @@ export class SSHService {
     }
   }
   
+  // 向会话缓冲区追加数据，超出上限时丢弃头部保留尾部
+  private appendTerminalBuffer(sessionId: string, chunk: string): void {
+    const session = this.terminalSessions.get(sessionId);
+    if (!session) return;
+
+    session.buffer += chunk;
+    session.cursor += chunk.length;
+
+    if (session.buffer.length > MAX_TERMINAL_BUFFER) {
+      const overflow = session.buffer.length - MAX_TERMINAL_BUFFER;
+      session.buffer = session.buffer.slice(overflow);
+      session.droppedBytes += overflow;
+    }
+  }
+
+  // 读取终端会话的输出。
+  //
+  // 这是 PTY 路径缺失的那一半：createTerminalSession 能开、writeToTerminal
+  // 能写，但此前没有任何工具能读回显——数据 emit 出去就丢了。
+  //
+  // since 传入上次返回的 cursor 即可增量读取；不传则返回当前缓冲区全部内容。
+  public readTerminal(sessionId: string, since?: number): {
+    data: string;
+    cursor: number;
+    droppedBytes: number;
+    isActive: boolean;
+    exitCode?: number;
+  } {
+    const session = this.terminalSessions.get(sessionId);
+    if (!session) {
+      throw new Error(`终端会话 ${sessionId} 不存在`);
+    }
+
+    let data = session.buffer;
+
+    if (typeof since === 'number' && since >= 0) {
+      // buffer 中最旧一个字节对应的全局游标
+      const bufferStart = session.cursor - session.buffer.length;
+      if (since >= session.cursor) {
+        // 调用方已读到最新位置，没有新数据
+        data = '';
+      } else if (since > bufferStart) {
+        // 请求位置仍在缓冲区内，切出增量部分
+        data = session.buffer.slice(since - bufferStart);
+      }
+      // since <= bufferStart：请求的数据已被丢弃，返回缓冲区全部内容
+    }
+
+    session.lastActivity = new Date();
+
+    return {
+      data,
+      cursor: session.cursor,
+      droppedBytes: session.droppedBytes,
+      isActive: session.isActive,
+      exitCode: session.exitCode
+    };
+  }
+
+  // 等待终端输出稳定后再读取。
+  //
+  // 交互式程序的响应不是瞬时的：writeToTerminal 返回时数据往往还在路上。
+  // 直接 readTerminal 多半读到空。这里轮询到「连续 quietMs 无新数据」
+  // 或超时为止，让调用方拿到一个完整的响应而不是半截。
+  public async readTerminalStable(
+    sessionId: string,
+    options?: { since?: number; timeout?: number; quietMs?: number }
+  ): Promise<{ data: string; cursor: number; droppedBytes: number; isActive: boolean; exitCode?: number; timedOut: boolean }> {
+    const timeout = options?.timeout ?? 5000;
+    const quietMs = options?.quietMs ?? 400;
+    const deadline = Date.now() + timeout;
+
+    let lastCursor = this.terminalSessions.get(sessionId)?.cursor ?? 0;
+    let quietSince = Date.now();
+
+    while (Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+
+      const session = this.terminalSessions.get(sessionId);
+      // 会话在等待期间关闭：立刻返回已有数据，不必空等到超时
+      if (!session) break;
+
+      if (session.cursor !== lastCursor) {
+        lastCursor = session.cursor;
+        quietSince = Date.now();
+        continue;
+      }
+
+      if (!session.isActive) break;
+
+      // 已经安静足够久，认为输出结束
+      if (Date.now() - quietSince >= quietMs) {
+        return { ...this.readTerminal(sessionId, options?.since), timedOut: false };
+      }
+    }
+
+    // 超时或会话已关闭：仍尽力返回已收到的数据
+    const session = this.terminalSessions.get(sessionId);
+    if (!session) {
+      return { data: '', cursor: lastCursor, droppedBytes: 0, isActive: false, timedOut: false };
+    }
+    return { ...this.readTerminal(sessionId, options?.since), timedOut: true };
+  }
+
   // 向终端写入数据
   public async writeToTerminal(sessionId: string, data: string): Promise<boolean> {
     const session = this.terminalSessions.get(sessionId);

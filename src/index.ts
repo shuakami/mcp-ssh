@@ -2,20 +2,18 @@
 
 import { SshMCP } from './tools/ssh.js';
 import { config } from 'dotenv';
-import { ProcessManager } from './process-manager.js';
 
 // 加载环境变量
 config();
 
 // 主函数
+//
+// 这里不做单实例互斥。MCP 是 stdio 协议，每个客户端窗口都会 spawn 一份
+// 自己的 server 并独占其 stdin/stdout，多个实例本来就该并存。
+// 早先的 .mcp-ssh.lock 方案不仅无效（锁写在 process.cwd()，即客户端
+// 打开的目录，不同目录之间互相看不见），还会在同一目录下让后启动的实例
+// SIGTERM 掉先启动的那个，连带杀死它已建立的 SSH 会话。
 async function main() {
-  // 初始化进程管理器
-  const processManager = new ProcessManager();
-  if (!await processManager.checkAndCreateLock()) {
-    console.error('无法创建进程锁，程序退出');
-    process.exit(1);
-  }
-
   // 实例化SSH MCP
   const sshMCP = new SshMCP();
 
